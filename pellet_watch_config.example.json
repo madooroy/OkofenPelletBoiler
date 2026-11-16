@@ -1,0 +1,12 @@
+{
+  "BOILER_IP": "192.168.1.50",
+  "JSON_PORT": 4321,
+  "JSON_PASSWORD": "your-json-password",
+  "FIRST_BASELINE": null,
+  "WINTER_MONTHS": [10, 11, 12, 1, 2, 3, 4],
+  "WINTER_ORDER": 650,
+  "WINTER_STOP": 700,
+  "SUMMER_ORDER": 675,
+  "SUMMER_STOP": 700,
+  "NTFY_TOPIC": ""
+}

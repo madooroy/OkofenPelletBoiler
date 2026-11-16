@@ -1,0 +1,7 @@
+# Your own settings and data - never commit these
+pellet_watch_config.json
+pellet_watch_state.json
+pellet_watch_state.json.tmp
+pellets.html
+pellets.html.tmp
+__pycache__/
