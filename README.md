@@ -155,6 +155,45 @@ python3 pellet_watch.py --delivered            # use the boiler's current readin
 python3 pellet_watch.py --delivered 13250      # or the reading on delivery day
 ```
 
+## Check that it's working
+
+Run these on the machine running the script, from the script's folder (on a Synology NAS: `cd /volume1/web` after logging in with SSH).
+
+**When the page was last updated:**
+
+```bash
+grep -o 'Checked [0-9-]* [0-9:]*' pellets.html
+```
+
+With a check every 6 hours, this should never be more than 6 hours old.
+
+**Recent readings, with times:**
+
+```bash
+python3 -c "import json,time;[print(time.strftime('%Y-%m-%d %H:%M',time.localtime(t)),'%.0f h'%h) for t,h in json.load(open('pellet_watch_state.json'))['history'][-10:]]"
+```
+
+You should see entries at your scheduled times. If the only entries are from when you ran the script by hand, the scheduled check isn't running.
+
+**The reset-button helper:**
+
+```bash
+ps aux | grep "[p]ellet_watch.py --serve"
+```
+
+One line of output means it's running. From another computer, `http://YOUR-NAS:8765/` should load.
+
+**On a Synology NAS**, Task Scheduler should list **two** pellet tasks:
+
+| Task | Next run time |
+|---|---|
+| The check (`pellet_watch.py`) | a time later today |
+| The button helper (`pellet_watch.py --serve`) | Boot-up |
+
+A common mistake is to create only the button helper. Everything looks fine at first, but the page never updates and no alert is ever sent.
+
+**Email:** in DSM, **Control Panel → Notification → Email → Send a test email**. If that arrives, the pellet alert will too.
+
 ## Choosing your thresholds
 
 You want the pellets to arrive before the hopper runs dry. Three numbers decide it:
