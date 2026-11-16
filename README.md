@@ -7,6 +7,7 @@ Know when to order pellets for an **ÖkoFEN Pellematic** boiler, without extra h
 - shows a fuel-gauge status page you can add to your phone's home screen
 - alerts you (email or phone push) when it's time to order, with an earlier order point in winter
 - has a **"Pellets delivered?"** button on the page to restart the count after a refill
+- tracks **burner cycling**: starts per day and average burn length over the last week, compared with the week before (useful when tuning thermostats or boiler settings to reduce short cycling)
 
 <img src="docs/screenshot.png" width="320" alt="Status page with a fuel gauge, hours until the order point, and the Pellets delivered button">
 

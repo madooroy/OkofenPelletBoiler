@@ -72,18 +72,32 @@ if HTML_PATH is None:
     HTML_PATH = os.path.join(HERE, "pellets.html")
 
 
-def read_burner_hours():
+def _number(value):
+    if isinstance(value, dict):          # some firmware wraps it as {"val": ...}
+        value = value.get("val")
+    return float(str(value).replace(",", ""))
+
+
+def read_boiler():
+    """(burner hours, burner starts). Starts is None if the boiler doesn't
+    report them."""
     url = "http://%s:%s/%s/all" % (BOILER_IP, JSON_PORT, JSON_PASSWORD)
     raw = urllib.request.urlopen(url, timeout=20).read()
     try:
         text = raw.decode("utf-8")
     except UnicodeDecodeError:
         text = raw.decode("latin-1")
-    data = json.loads(text)
-    value = data["pe1"]["L_runtime"]
-    if isinstance(value, dict):          # some firmware wraps it as {"val": ...}
-        value = value.get("val")
-    return float(str(value).replace(",", ""))
+    pe1 = json.loads(text)["pe1"]
+    hours = _number(pe1["L_runtime"])
+    try:
+        starts = _number(pe1["L_starts"])
+    except (KeyError, ValueError, TypeError):
+        starts = None
+    return hours, starts
+
+
+def read_burner_hours():
+    return read_boiler()[0]
 
 
 def thresholds():
@@ -127,11 +141,61 @@ def hours_per_day(history):
     """Average burn rate over the stored readings (up to ~14 days)."""
     if len(history) < 2:
         return None
-    (t0, h0), (t1, h1) = history[0], history[-1]
+    (t0, h0), (t1, h1) = history[0][:2], history[-1][:2]
     days = (t1 - t0) / 86400.0
     if days < 0.5 or h1 <= h0:
         return None
     return (h1 - h0) / days
+
+
+def cycling_window(cycles, end_time, days=7):
+    """Starts per day and average burn minutes for the `days` before end_time.
+    None until at least a day of readings is available. Burner hours are
+    whole numbers, so short windows are rough."""
+    pts = [c for c in cycles if c[2] is not None and c[0] <= end_time + 60]
+    if len(pts) < 2:
+        return None
+    last = pts[-1]
+    window = [c for c in pts if c[0] >= last[0] - days * 86400]
+    first = window[0]
+    span = (last[0] - first[0]) / 86400.0
+    d_starts = last[2] - first[2]
+    d_hours = last[1] - first[1]
+    if span < 1.0 or d_starts <= 0 or d_hours < 0:
+        return None
+    return {"days": span, "starts_per_day": d_starts / span,
+            "avg_burn_min": d_hours * 60.0 / d_starts}
+
+
+def cycling_rows(cycles, now_hours):
+    """Table rows for the burner cycling section, or "" if no data yet."""
+    if not cycles or cycles[-1][2] is None:
+        return ""
+    starts = cycles[-1][2]
+    rows = []
+    cur = cycling_window(cycles, cycles[-1][0])
+    prev = cycling_window(cycles, cycles[-1][0] - 7 * 86400)
+
+    def was(key, fmt):
+        return (" <span class='was'>(week before: %s)</span>" % (fmt % prev[key])
+                if prev and cur and cur["days"] >= 6 else "")
+    if cur:
+        label = "last %d days" % round(cur["days"]) if cur["days"] >= 1.5 else "last day"
+        rows.append("<tr><td>Starts per day <span class='was'>(%s)</span></td>"
+                    "<td>%.0f%s</td></tr>" % (label, cur["starts_per_day"],
+                                              was("starts_per_day", "%.0f")))
+        rows.append("<tr><td>Average burn <span class='was'>(%s)</span></td>"
+                    "<td>%.0f min%s</td></tr>" % (label, cur["avg_burn_min"],
+                                                  was("avg_burn_min", "%.0f min")))
+    else:
+        rows.append("<tr><td colspan='2' class='was'>Recent cycling figures appear "
+                    "after a day of readings.</td></tr>")
+    if starts > 0:
+        rows.append("<tr><td>Average burn (lifetime)</td><td>%.0f min</td></tr>"
+                    % (now_hours * 60.0 / starts))
+    rows.append("<tr><td>Burner starts (lifetime)</td><td>%s</td></tr>"
+                % format(starts, ",.0f"))
+    return "<h2>Burner cycling</h2>\n<table>\n%s\n</table>" % "\n".join(rows)
 
 
 def gauge_svg(used):
@@ -227,11 +291,13 @@ def write_page(now_hours, state, level, error=None):
 <tr><td>%s order point</td><td>%s h (%d)</td></tr>
 <tr><td>Hard stop</td><td>%s h (%d)</td></tr>
 %s
-</table>""" % (colors[level], labels[level], gauge_svg(used), used, stop,
+</table>
+%s""" % (colors[level], labels[level], gauge_svg(used), used, stop,
                "%.0f h" % left if left > 0 else "now",
                format(now_hours, ",.0f"), format(baseline, ",.0f"),
                season, format(baseline + order, ",.0f"), order,
-               format(baseline + stop, ",.0f"), stop, eta)
+               format(baseline + stop, ",.0f"), stop, eta,
+               cycling_rows(state.get("cycles", []), now_hours))
     page = """<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -240,6 +306,8 @@ def write_page(now_hours, state, level, error=None):
 <style>
 body{font-family:system-ui,sans-serif;background:#2b2b2b;color:#eee;max-width:26rem;margin:2rem auto;padding:0 1rem}
 h1{font-size:1.1rem;font-weight:600;color:#9c9}
+h2{font-size:1rem;font-weight:600;color:#9c9;margin:1.6rem 0 0}
+.was{color:#999;font-size:.85em}
 .badge{display:inline-block;padding:.3rem .8rem;border-radius:1rem;font-weight:700;color:#fff}
 .big{font-size:3rem;font-weight:700;margin:0 0 .3rem;text-align:center}
 .big span{font-size:1rem;font-weight:400;color:#aaa}
@@ -277,8 +345,9 @@ def run(delivered=False, new_baseline=None):
     new_baseline (or from the boiler's current reading when None)."""
     state = load_state()
 
+    starts = None
     try:
-        now_hours = read_burner_hours()
+        now_hours, starts = read_boiler()
     except Exception as e:
         if new_baseline is None:
             print("Could not read the boiler: %s" % e)
@@ -307,6 +376,13 @@ def run(delivered=False, new_baseline=None):
     history.append([time.time(), now_hours])
     cutoff = time.time() - 14 * 86400
     state["history"] = [h for h in history if h[0] >= cutoff][-400:]
+
+    # Burner starts, kept across deliveries (60 days) for the cycling figures.
+    if starts is not None:
+        cycles = state.get("cycles", [])
+        cycles.append([time.time(), now_hours, starts])
+        cutoff = time.time() - 60 * 86400
+        state["cycles"] = [c for c in cycles if c[0] >= cutoff][-1500:]
 
     summary = "%.0f burner hours used since the last delivery; %s order point is " \
               "%d h, hard stop %d h. Boiler reads %.0f h." \
