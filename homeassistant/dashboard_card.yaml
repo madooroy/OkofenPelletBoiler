@@ -1,0 +1,41 @@
+# Dashboard card for the pellet_watch package.
+# In a dashboard: Edit > Add card > Manual, and paste everything below.
+type: vertical-stack
+cards:
+  - type: gauge
+    name: Pellets - hours since delivery
+    entity: sensor.pellet_hours_since_delivery
+    unit: h
+    min: 0
+    max: 770
+    needle: true
+    severity:
+      green: 0
+      yellow: 650
+      red: 700
+  - type: entities
+    entities:
+      - entity: sensor.pellet_status
+        name: Status
+      - entity: sensor.pellet_burner_run_time
+        name: Burner run time now
+      - entity: input_number.pellet_delivery_hours
+        name: At last delivery
+      - type: attribute
+        entity: sensor.pellet_hours_since_delivery
+        attribute: order_point
+        name: Order point
+        suffix: h
+      - type: attribute
+        entity: sensor.pellet_hours_since_delivery
+        attribute: hard_stop
+        name: Hard stop
+        suffix: h
+  - type: button
+    name: Pellets delivered
+    icon: mdi:truck-check
+    tap_action:
+      action: perform-action
+      perform_action: script.pellets_delivered
+      confirmation:
+        text: Restart the pellet count from the boiler's current reading?

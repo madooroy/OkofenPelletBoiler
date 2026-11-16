@@ -14,6 +14,8 @@ Know when to order pellets for an **ÖkoFEN Pellematic** boiler, without extra h
 
 Pellet use tracks burner run time closely. For a hopper that's refilled when nearly empty, the hours between deliveries are a reliable "fuel gauge". Ökofen sells weighing cells for the storage tank that do this properly. This project is the free, software-only version for everyone else.
 
+> **Using Home Assistant?** There's an HA-only version (sensors, alert automation, dashboard card) in [`homeassistant/`](homeassistant/README.md). No script needed.
+
 ## What you need
 
 - An ÖkoFEN boiler with a **Pelletronic Touch** controller on your home network
@@ -183,6 +185,7 @@ The page shows your measured burn rate (h/day) and an estimated "Order by" date 
 ## Credits
 
 - Field names from the community [Ökofen JSON documentation](https://github.com/thannaske/oekofen-json-documentation)
+- Home Assistant version built on the [oekofen-pellematic-compact](https://github.com/dominikamann/oekofen-pellematic-compact) integration
 - Not affiliated with or endorsed by ÖkoFEN. "ÖkoFEN" and "Pellematic" are trademarks of their owner.
 
 ## License

@@ -1,0 +1,147 @@
+# Pellet reorder reminder for ÖkoFEN Pellematic boilers - Home Assistant package
+#
+# Same idea as pellet_watch.py, done inside Home Assistant: count PE1 burner
+# hours since the last pellet delivery, alert at a season-dependent order point
+# and a hard stop, and restart the count with one tap after a delivery.
+#
+# Needs the oekofen-pellematic-compact integration (HACS):
+#   https://github.com/dominikamann/oekofen-pellematic-compact
+#
+# Setup: see homeassistant/README.md. In short:
+#   1. Copy this file to /config/packages/pellet_watch.yaml
+#   2. Change the ONE entity ID marked "CHANGE ME" below
+#   3. Restart Home Assistant, then run the "Pellets delivered" script once
+#      with your burner hours at the last delivery.
+
+input_number:
+  # Burner hours at the last delivery. Set by the "Pellets delivered" script.
+  pellet_delivery_hours:
+    name: Pellets - burner hours at last delivery
+    icon: mdi:truck-delivery
+    min: 0
+    max: 1000000
+    step: 1
+    mode: box
+    unit_of_measurement: h
+
+template:
+  - sensor:
+      # Copy of the boiler's burner run time, so the rest of this file only
+      # needs one entity ID.
+      - name: Pellet burner run time
+        unique_id: pellet_watch_burner_run_time
+        unit_of_measurement: h
+        icon: mdi:fire
+        state_class: total_increasing
+        # CHANGE ME: your integration's PE1 burner runtime sensor (pe1 L_runtime).
+        # Find it in Settings > Devices & services > Entities, search "runtime".
+        state: "{{ states('sensor.pellematic_pe1_runtime') | float(none) }}"
+        availability: "{{ states('sensor.pellematic_pe1_runtime') | is_number }}"
+
+      - name: Pellet hours since delivery
+        unique_id: pellet_watch_hours_since_delivery
+        unit_of_measurement: h
+        icon: mdi:gauge
+        state: >
+          {{ (states('sensor.pellet_burner_run_time') | float(0)
+              - states('input_number.pellet_delivery_hours') | float(0))
+             | round(0) | int }}
+        availability: "{{ states('sensor.pellet_burner_run_time') | is_number }}"
+        attributes:
+          # Edit thresholds here: "<winter value> if <winter months> else <summer value>".
+          # Winter = October through April.
+          season: >
+            {{ 'winter' if now().month in [10, 11, 12, 1, 2, 3, 4] else 'summer' }}
+          order_point: >
+            {{ 650 if now().month in [10, 11, 12, 1, 2, 3, 4] else 675 }}
+          hard_stop: >
+            {{ 700 if now().month in [10, 11, 12, 1, 2, 3, 4] else 700 }}
+
+      - name: Pellet status
+        unique_id: pellet_watch_status
+        icon: mdi:alert-circle-outline
+        state: >
+          {% set used = states('sensor.pellet_hours_since_delivery') | float(0) %}
+          {% set order = state_attr('sensor.pellet_hours_since_delivery', 'order_point') | float(650) %}
+          {% set stop = state_attr('sensor.pellet_hours_since_delivery', 'hard_stop') | float(700) %}
+          {{ 'stop' if used >= stop else 'order' if used >= order else 'ok' }}
+        availability: "{{ states('sensor.pellet_hours_since_delivery') | is_number }}"
+
+script:
+  pellets_delivered:
+    alias: Pellets delivered
+    icon: mdi:truck-check
+    description: >
+      Restart the count after a pellet delivery. Leave "hours" empty to use the
+      boiler's current reading, or enter the reading from delivery day.
+    fields:
+      hours:
+        name: Burner hours at delivery
+        description: Leave empty to use the current reading.
+        required: false
+        selector:
+          number:
+            min: 0
+            max: 1000000
+            mode: box
+            unit_of_measurement: h
+    sequence:
+      - action: input_number.set_value
+        target:
+          entity_id: input_number.pellet_delivery_hours
+        data:
+          value: >
+            {{ hours if hours is defined and hours not in ['', none]
+               else states('sensor.pellet_burner_run_time') | float(0) }}
+
+automation:
+  - alias: Pellets - order reminder
+    id: pellet_watch_order_reminder
+    description: >
+      Notify when the order point or hard stop is reached, then once a day at
+      9:00 until pellets are delivered and the count is restarted.
+    mode: single
+    triggers:
+      - trigger: state
+        entity_id: sensor.pellet_status
+        to: [order, stop]
+      - trigger: time
+        at: "09:00:00"
+    conditions:
+      - condition: state
+        entity_id: sensor.pellet_status
+        state: [order, stop]
+    actions:
+      - variables:
+          used: "{{ states('sensor.pellet_hours_since_delivery') }}"
+          order: "{{ state_attr('sensor.pellet_hours_since_delivery', 'order_point') }}"
+          stop: "{{ state_attr('sensor.pellet_hours_since_delivery', 'hard_stop') }}"
+          title: >
+            {{ 'Pellets OVERDUE - order now' if is_state('sensor.pellet_status', 'stop')
+               else 'Time to order pellets' }}
+          message: >
+            {{ used }} burner hours since the last delivery
+            (order point {{ order }} h, hard stop {{ stop }} h).
+      - action: persistent_notification.create
+        data:
+          notification_id: pellet_watch
+          title: "{{ title }}"
+          message: "{{ message }}"
+      # CHANGE ME (optional): your phone, e.g. notify.mobile_app_marcs_iphone.
+      # notify.notify sends to the default notifier if you have one.
+      - action: notify.notify
+        continue_on_error: true
+        data:
+          title: "{{ title }}"
+          message: "{{ message }}"
+
+  - alias: Pellets - clear reminder after delivery
+    id: pellet_watch_clear_reminder
+    triggers:
+      - trigger: state
+        entity_id: sensor.pellet_status
+        to: ok
+    actions:
+      - action: persistent_notification.dismiss
+        data:
+          notification_id: pellet_watch
