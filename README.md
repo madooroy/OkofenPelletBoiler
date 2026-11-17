@@ -82,6 +82,7 @@ Optional keys (defaults in brackets):
 | `DEGREE_DAY_BASE` | Base for heating degree-days, °C [18.3, i.e. 65 °F] |
 | `LOG_SECONDS` | `--serve` logs boiler readings this often to `pellet_watch_log_YYYY-MM.csv` [0 = off; 60 = every minute] |
 | `LOG_KEEP_MONTHS` | Months of log files to keep [3] |
+| `WEATHER_UNIT` | Unit the boiler reports the online weather temperature in [`"C"`; `"F"` on imperial-unit boilers] |
 | `TEMP_FACTOR` | Units of the boiler's temperatures [0.1, i.e. tenths of a degree] |
 | `NTFY_TOPIC` | Optional phone push via [ntfy.sh](https://ntfy.sh): a hard-to-guess topic name [off] |
 
@@ -234,7 +235,7 @@ The Pelletronic Touch fetches an online weather forecast for your location (Main
 - **Burner hours per degree-day**: burner hours divided by degree-days. Unlike pounds per burner hour, this measures efficiency fairly across mild and cold weeks, so it shows whether a change (thermostat settings, a buffer tank, a new boiler setting) actually helped.
 - **Suggested setpoint (advisory)**: the boiler temperature a simple outdoor-temperature curve would choose, alongside the boiler's actual setpoint. By default the curve runs from 74 °C at -10 °C outside to 65 °C at +10 °C outside. **Nothing is sent to the boiler.** It's there to collect evidence before you discuss outdoor reset with your installer, who should confirm the lowest safe boiler temperature for your system.
 
-Run `python3 pellet_watch.py --status` once to check the readings: the outdoor temperature should match the Weather page in the app, and the boiler temperature the app's boiler page. If they're out by a factor of ten, set `TEMP_FACTOR` to 1.
+Run `python3 pellet_watch.py --status` once to check the readings: the outdoor temperature should match the Weather page in the app, and the boiler temperature the app's boiler page. If they're out by a factor of ten, set `TEMP_FACTOR` to 1. On boilers set to imperial units, the online weather temperature comes through in °F while boiler temperatures stay in °C: if the outdoor reading looks like the °F number treated as °C (e.g. 88 °F on a 31 °F morning), set `"WEATHER_UNIT": "F"`.
 
 ### Minute-by-minute log
 

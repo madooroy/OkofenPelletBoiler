@@ -100,7 +100,9 @@ NTFY_TOPIC = ""                  # optional phone push: pick a hard-to-guess
                                  # topic name and subscribe to it in the ntfy app
 
 TEMP_UNIT = "C"                  # "C" or "F" for temperatures on the page
-TEMP_FACTOR = 0.1                # the JSON interface reports 0.1 degC units
+TEMP_FACTOR = 0.1                # the JSON interface reports 0.1-degree units
+WEATHER_UNIT = "C"               # unit of the online weather temperature
+                                 # (weather.L_temp); "F" on imperial-unit boilers
 
 # Advisory outdoor reset (nothing is written to the boiler): the boiler
 # setpoint a straight-line curve would choose between these two points,
@@ -135,6 +137,7 @@ SETTING_TYPES = {
     "SERVE_PORT": int, "STALE_HOURS": (int, float), "MILESTONES": list,
     "DAILY_REMINDER": bool, "REMINDER_HOUR": int, "ORDER_URL": str,
     "NTFY_TOPIC": str, "TEMP_UNIT": str, "TEMP_FACTOR": (int, float),
+    "WEATHER_UNIT": str,
     "ADVISORY": bool, "ADVISORY_COLD_OUTDOOR": (int, float),
     "ADVISORY_COLD_BOILER": (int, float), "ADVISORY_MILD_OUTDOOR": (int, float),
     "ADVISORY_MILD_BOILER": (int, float), "DEGREE_DAY_BASE": (int, float),
@@ -185,6 +188,8 @@ def load_config():
         raise SetupError("WINTER_MONTHS must be month numbers 1-12")
     if g["TEMP_UNIT"] not in ("C", "F"):
         raise SetupError('TEMP_UNIT must be "C" or "F"')
+    if g["WEATHER_UNIT"] not in ("C", "F"):
+        raise SetupError('WEATHER_UNIT must be "C" or "F"')
     if g["ADVISORY_COLD_OUTDOOR"] >= g["ADVISORY_MILD_OUTDOOR"]:
         raise SetupError("ADVISORY_COLD_OUTDOOR must be below ADVISORY_MILD_OUTDOOR")
     if g["LOG_SECONDS"] and g["LOG_SECONDS"] < 30:
@@ -220,7 +225,7 @@ def read_boiler_once():
         starts = None
     weather = data.get("weather") or {}
     extra = {
-        "outdoor": _temp(weather.get("L_temp"), -50, 50),
+        "outdoor": _outdoor(weather.get("L_temp")),
         "boiler": _temp(pe1.get("L_temp_act"), -10, 120),
         "boiler_set": _temp(pe1.get("L_temp_set"), 0, 120),
         "chamber": _temp(pe1.get("L_frt_temp_act"), -10, 1200),
@@ -248,6 +253,22 @@ def _temp(value, lo, hi):
         return None
     v = round(v * TEMP_FACTOR, 1)
     return v if lo <= v <= hi else None
+
+
+def _outdoor(value):
+    """Online-weather temperature in degC, converted if the boiler reports
+    it in degF (WEATHER_UNIT)."""
+    v = _temp(value, -60, 130)
+    if v is not None and WEATHER_UNIT == "F":
+        v = round((v - 32) * 5 / 9, 1)
+    return v if v is not None and -50 <= v <= 50 else None
+
+
+def _setpoint(extra):
+    """The boiler's current target in degC, or None while it isn't heating
+    (the boiler then reports a placeholder such as 8 degC)."""
+    v = extra.get("boiler_set")
+    return v if v is not None and v >= 40 else None
 
 
 def _text(value):
@@ -537,9 +558,9 @@ def weather_rows(extra, cycles):
     if extra.get("boiler") is not None:
         rows.append("<tr><td>Boiler water now</td><td>%s</td></tr>"
                     % fmt_temp(extra["boiler"]))
-    if extra.get("boiler_set") is not None:
+    if _setpoint(extra) is not None:
         rows.append("<tr><td>Boiler setpoint now</td><td>%s</td></tr>"
-                    % fmt_temp(extra["boiler_set"]))
+                    % fmt_temp(_setpoint(extra)))
     sug = suggested_setpoint(out)
     if sug is not None:
         rows.append("<tr><td>Suggested setpoint <span class='was'>(advisory)</span>"
@@ -863,7 +884,8 @@ def status():
     print("Outdoor (online weather): %s. Boiler water %s, setpoint %s, state %s "
           "(%s), modulation %s. Suggested setpoint (advisory): %s."
           % (fmt_temp(extra.get("outdoor"), 1), fmt_temp(extra.get("boiler"), 1),
-             fmt_temp(extra.get("boiler_set"), 1), extra.get("statetext") or "?",
+             fmt_temp(_setpoint(extra), 1) if _setpoint(extra) is not None
+             else "none (not heating)", extra.get("statetext") or "?",
              extra.get("state") if extra.get("state") is not None else "?",
              "?" if extra.get("modulation") is None else "%.0f%%" % extra["modulation"],
              fmt_temp(sug, 1)))
