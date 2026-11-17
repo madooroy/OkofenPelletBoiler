@@ -5,7 +5,7 @@ Know when to order pellets for an **ÖkoFEN Pellematic** boiler, without extra h
 `pellet_watch.py` reads the boiler's **burner run time** over its local JSON interface, counts the hours since your last pellet delivery, and:
 
 - shows a fuel-gauge status page you can add to your phone's home screen
-- alerts you (email or phone push) when it's time to order, with an earlier order point in winter
+- alerts you (email or phone push) at a quarter, half and three-quarters of the way to the order point, then at the order point and the hard stop, with a daily reminder until the next delivery; the order point is earlier in winter
 - has a **"Pellets delivered?"** button on the page to restart the count after a refill
 - tracks **burner cycling**: starts per day and average burn length over the last week, compared with the week before (useful when tuning thermostats or boiler settings to reduce short cycling)
 
@@ -69,6 +69,8 @@ Optional keys (defaults in brackets):
 | `SUMMER_ORDER` / `SUMMER_STOP` | Summer order point / hard stop [675 / 700] |
 | `HTML_PATH` | Where to write the status page [`pellets.html` next to the script; `""` = none] |
 | `SERVE_PORT` | Port for the page's reset button and built-in web server [8765] |
+| `MILESTONES` | Heads-up alerts as fractions of the order point, each sent once per delivery [`[0.25, 0.5, 0.75]`; `[]` = none] |
+| `DAILY_REMINDER` / `REMINDER_HOUR` | Repeat the alert daily after the order point, at the first check from this hour on [true / 8] |
 | `NTFY_TOPIC` | Optional phone push via [ntfy.sh](https://ntfy.sh): a hard-to-guess topic name [off] |
 
 Your settings live in the config file, so you can drop in a newer `pellet_watch.py` without re-entering anything.
@@ -95,7 +97,7 @@ In **Control Panel → Task Scheduler** create two tasks:
 
 1. **Scheduled Task → User-defined script**: daily or every few hours.
    - Run command: `python3 /volume1/web/pellet_watch.py`
-   - Task Settings: tick **Send run details by email** and **only when the script terminates abnormally**. The script exits with an error code at the order point and the hard stop, so DSM emails you. (Control Panel → Notification → Email must be set up.)
+   - Task Settings: tick **Send run details by email** and **only when the script terminates abnormally**. The script exits with an error code only on checks that raise an alert (each heads-up milestone, the order point, the hard stop, then once a day until you restart the count), so DSM emails you then and stays quiet otherwise. The first line of the email says which alert it is. (Control Panel → Notification → Email must be set up.)
 2. **Triggered Task → User-defined script**, Event **Boot-up**, user `root`.
    - Run command: `python3 /volume1/web/pellet_watch.py --serve`
    - Select it and click **Run** once to start it now. This powers the "Pellets delivered?" button.
@@ -214,7 +216,7 @@ The page shows your measured burn rate (h/day) and an estimated "Order by" date 
 | Code | Meaning |
 |---|---|
 | 0 | Fine |
-| 1 | Order point or hard stop reached |
+| 1 | Alert on this check: a heads-up milestone, the order point, the hard stop, or the daily reminder after the order point |
 | 2 | Couldn't read the boiler |
 
 ## Security notes

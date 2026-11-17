@@ -16,7 +16,8 @@ Usage:
     python3 pellet_watch.py --serve       keep running: serves the status page and
                                           handles its "Pellets delivered" button
 
-Exit code: 0 = fine, 1 = reorder threshold reached, 2 = could not read boiler.
+Exit code: 0 = fine, 1 = alert on this check (heads-up, order point, hard stop or
+daily reminder), 2 = could not read boiler.
 (DSM Task Scheduler can email you whenever the exit code is not 0.)
 """
 
@@ -48,6 +49,14 @@ FIRST_BASELINE = None            # burner hours at your last delivery, used once
 HTML_PATH  = None                # status page; None = pellets.html next to this
                                  # script, "" = no page
 SERVE_PORT = 8765                # port for the page's "Pellets delivered" button
+
+# Heads-up alerts on the way to the order point, as fractions of it
+# (0.25 = a quarter of the way). Each is sent once per delivery. [] = none.
+MILESTONES = [0.25, 0.5, 0.75]
+# After the order point or hard stop: repeat the alert once a day (at the first
+# check from this hour on) until the count is restarted. False = alert once.
+DAILY_REMINDER = True
+REMINDER_HOUR = 8
 NTFY_TOPIC = ""                  # optional phone push: pick a hard-to-guess
                                  # topic name and subscribe to it in the ntfy app
 # ---------------------------------------------------------------------------
@@ -64,7 +73,8 @@ try:
         for _k, _v in json.load(_f).items():
             if _k in ("BOILER_IP", "JSON_PORT", "JSON_PASSWORD", "WINTER_MONTHS",
                       "WINTER_ORDER", "WINTER_STOP", "SUMMER_ORDER", "SUMMER_STOP",
-                      "HTML_PATH", "NTFY_TOPIC", "SERVE_PORT", "FIRST_BASELINE"):
+                      "HTML_PATH", "NTFY_TOPIC", "SERVE_PORT", "FIRST_BASELINE",
+                      "MILESTONES", "DAILY_REMINDER", "REMINDER_HOUR"):
                 globals()[_k] = _v
 except OSError:
     pass
@@ -188,7 +198,7 @@ def cycling_rows(cycles, now_hours):
                     "<td>%.0f min%s</td></tr>" % (label, cur["avg_burn_min"],
                                                   was("avg_burn_min", "%.0f min")))
     else:
-        rows.append("<tr><td colspan='2' class='was'>Recent cycling figures appear "
+        rows.append("<tr><td colspan='2' class='was' style='text-align:left'>Recent cycling figures appear "
                     "after a day of readings.</td></tr>")
     if starts > 0:
         rows.append("<tr><td>Average burn (lifetime)</td><td>%.0f min</td></tr>"
@@ -364,6 +374,8 @@ def run(delivered=False, new_baseline=None):
         state["baseline"] = new_baseline if new_baseline is not None else now_hours
         state["level"] = "ok"
         state["history"] = []
+        state["notified"] = []
+        state.pop("last_reminder", None)
         print("Count restarted. Baseline is now %.0f h; order at %.0f h."
               % (state["baseline"], state["baseline"] + thresholds()[0]))
 
@@ -387,24 +399,54 @@ def run(delivered=False, new_baseline=None):
     summary = "%.0f burner hours used since the last delivery; %s order point is " \
               "%d h, hard stop %d h. Boiler reads %.0f h." \
               % (used, season.lower(), order, stop, now_hours)
-    print(summary)
-
-    if level != state.get("level") and level != "ok":
-        title = "Pellets OVERDUE - order now" if level == "stop" else "Time to order pellets"
-        push(title, summary)
+    alert = pick_alert(state, used, order, stop, level)
     state["level"] = level
-
     save_state(state)
     write_page(now_hours, state, level)
 
-    if level == "stop":
-        print("HARD STOP REACHED - order pellets now; the hopper may run dry "
-              "before they arrive.")
+    if alert:
+        # Headline first: it is the first line of the DSM Task Scheduler email.
+        print(alert)
+        print(summary)
+        push(alert, summary)
         return 1
-    if level == "order":
-        print("ORDER POINT REACHED - time to order pellets.")
-        return 1
+    print(summary)
     return 0
+
+
+def pick_alert(state, used, order, stop, level):
+    """The alert to send on this check, or None. Updates state["notified"].
+    Heads-up milestones, the order point and the hard stop are each sent once
+    per delivery; past the order point a daily reminder follows if enabled."""
+    marks = [("%d%%" % round(f * 100), f * order) for f in sorted(MILESTONES)]
+    marks += [("order", order), ("stop", stop)]
+    reached = [key for key, hours in marks if used >= hours]
+    if "notified" not in state:
+        # First run with this version: don't send alerts for points passed
+        # before it was installed, except the order point and hard stop.
+        state["notified"] = [k for k in reached if k not in ("order", "stop")]
+    new = [k for k in reached if k not in state["notified"]]
+    state["notified"] += new
+    today = time.strftime("%Y-%m-%d")
+
+    if "stop" in new or (level == "stop" and new):
+        state["last_reminder"] = today
+        return ("Pellets OVERDUE - hard stop of %d h reached. Order now; the "
+                "hopper may run dry before they arrive." % stop)
+    if "order" in new:
+        state["last_reminder"] = today
+        return "Time to order pellets - order point of %d h reached." % order
+    if new:
+        return ("Pellets heads-up: %s of the way to the order point "
+                "(%.0f of %d h, %.0f h to go)." % (new[-1], used, order, order - used))
+    if (DAILY_REMINDER and level in ("order", "stop")
+            and state.get("last_reminder") != today
+            and time.localtime().tm_hour >= REMINDER_HOUR):
+        state["last_reminder"] = today
+        if level == "stop":
+            return "Reminder: pellets OVERDUE (%.0f of %d h). Order now." % (used, stop)
+        return "Reminder: time to order pellets (%.0f of %d h)." % (used, order)
+    return None
 
 
 class ResetHandler(BaseHTTPRequestHandler):
