@@ -57,6 +57,9 @@ MILESTONES = [0.25, 0.5, 0.75]
 # check from this hour on) until the count is restarted. False = alert once.
 DAILY_REMINDER = True
 REMINDER_HOUR = 8
+# Your pellet supplier's ordering page. Added to order alerts (email and push)
+# and shown as a button on the status page once it's time to order. "" = none.
+ORDER_URL = ""
 NTFY_TOPIC = ""                  # optional phone push: pick a hard-to-guess
                                  # topic name and subscribe to it in the ntfy app
 # ---------------------------------------------------------------------------
@@ -74,7 +77,7 @@ try:
             if _k in ("BOILER_IP", "JSON_PORT", "JSON_PASSWORD", "WINTER_MONTHS",
                       "WINTER_ORDER", "WINTER_STOP", "SUMMER_ORDER", "SUMMER_STOP",
                       "HTML_PATH", "NTFY_TOPIC", "SERVE_PORT", "FIRST_BASELINE",
-                      "MILESTONES", "DAILY_REMINDER", "REMINDER_HOUR"):
+                      "MILESTONES", "DAILY_REMINDER", "REMINDER_HOUR", "ORDER_URL"):
                 globals()[_k] = _v
 except OSError:
     pass
@@ -133,14 +136,17 @@ def save_state(state):
     os.replace(tmp, STATE_PATH)
 
 
-def push(title, message):
+def push(title, message, click_url=""):
     if not NTFY_TOPIC:
         return
+    headers = {"Title": title, "Priority": "high", "Tags": "fire"}
+    if click_url:
+        headers["Click"] = click_url     # tapping the notification opens it
     try:
         req = urllib.request.Request(
             "https://ntfy.sh/" + NTFY_TOPIC,
             data=message.encode("utf-8"),
-            headers={"Title": title, "Priority": "high", "Tags": "fire"},
+            headers=headers,
         )
         urllib.request.urlopen(req, timeout=20)
     except Exception as e:               # a failed push must not stop the check
@@ -273,9 +279,13 @@ def write_page(now_hours, state, level, error=None):
     baseline = state["baseline"]
     used = max(0.0, now_hours - baseline) if now_hours is not None else None
     order, stop, season = thresholds()
-    level = {"warn": "order", "order": "stop"}.get(level, level)   # old state files
+    level = {"warn": "order"}.get(level, level)   # very old state files
     colors = {"ok": "#3a9a3a", "order": "#d99a00", "stop": "#c62828"}
     labels = {"ok": "OK", "order": "Order pellets", "stop": "OVERDUE - ORDER NOW"}
+    order_button = ""
+    if ORDER_URL and level in ("order", "stop"):
+        order_button = ('<a class="orderbtn" href="%s" target="_blank" rel="noopener">'
+                        'Order pellets</a>' % html.escape(ORDER_URL, quote=True))
     if error:
         body = "<p class='err'>Could not read the boiler: %s</p>" % html.escape(error)
     else:
@@ -294,6 +304,7 @@ def write_page(now_hours, state, level, error=None):
 <div class="badge" style="background:%s">%s</div>
 %s
 <div class="big">%.0f <span>of %d h</span></div>
+%s
 <table>
 <tr><td>Hours until order point</td><td>%s</td></tr>
 <tr><td>Burner run time now</td><td>%s h</td></tr>
@@ -302,7 +313,7 @@ def write_page(now_hours, state, level, error=None):
 <tr><td>Hard stop</td><td>%s h (%d)</td></tr>
 %s
 </table>
-%s""" % (colors[level], labels[level], gauge_svg(used), used, stop,
+%s""" % (colors[level], labels[level], gauge_svg(used), used, stop, order_button,
                "%.0f h" % left if left > 0 else "now",
                format(now_hours, ",.0f"), format(baseline, ",.0f"),
                season, format(baseline + order, ",.0f"), order,
@@ -318,6 +329,8 @@ body{font-family:system-ui,sans-serif;background:#2b2b2b;color:#eee;max-width:26
 h1{font-size:1.1rem;font-weight:600;color:#9c9}
 h2{font-size:1rem;font-weight:600;color:#9c9;margin:1.6rem 0 0}
 .was{color:#999;font-size:.85em}
+.orderbtn{display:block;text-align:center;margin:.8rem 0;padding:.8rem;border-radius:.5rem;
+  background:#d99a00;color:#fff;font-weight:700;font-size:1.1rem;text-decoration:none}
 .badge{display:inline-block;padding:.3rem .8rem;border-radius:1rem;font-weight:700;color:#fff}
 .big{font-size:3rem;font-weight:700;margin:0 0 .3rem;text-align:center}
 .big span{font-size:1rem;font-weight:400;color:#aaa}
@@ -406,9 +419,12 @@ def run(delivered=False, new_baseline=None):
 
     if alert:
         # Headline first: it is the first line of the DSM Task Scheduler email.
+        url = ORDER_URL if level in ("order", "stop") else ""
         print(alert)
+        if url:
+            print("Order pellets here: %s" % url)
         print(summary)
-        push(alert, summary)
+        push(alert, summary, url)
         return 1
     print(summary)
     return 0

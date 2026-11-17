@@ -71,6 +71,7 @@ Optional keys (defaults in brackets):
 | `SERVE_PORT` | Port for the page's reset button and built-in web server [8765] |
 | `MILESTONES` | Heads-up alerts as fractions of the order point, each sent once per delivery [`[0.25, 0.5, 0.75]`; `[]` = none] |
 | `DAILY_REMINDER` / `REMINDER_HOUR` | Repeat the alert daily after the order point, at the first check from this hour on [true / 8] |
+| `ORDER_URL` | Your supplier's ordering page: added to order alerts and shown as an "Order pellets" button on the page once it's time [none] |
 | `NTFY_TOPIC` | Optional phone push via [ntfy.sh](https://ntfy.sh): a hard-to-guess topic name [off] |
 
 Your settings live in the config file, so you can drop in a newer `pellet_watch.py` without re-entering anything.
