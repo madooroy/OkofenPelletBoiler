@@ -11,3 +11,5 @@ pellet_watch.lock
 pellet_watch_state.json.bak
 *.tmp
 pellet_watch_log_*.csv
+pellet_watch_beestat.json
+pellet_watch_ecobee_*.csv

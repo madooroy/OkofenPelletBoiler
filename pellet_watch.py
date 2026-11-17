@@ -36,6 +36,7 @@ DSM Task Scheduler can email you whenever the exit code is not 0.
 """
 
 import argparse
+import calendar
 import csv
 import glob
 import threading
@@ -119,6 +120,13 @@ DEGREE_DAY_BASE = 18.3           # degC (65 degF), for heating degree-days
 # outdoor temperature) written by --serve to pellet_watch_log_YYYY-MM.csv.
 LOG_SECONDS = 0                  # 0 = off; 60 = once a minute
 LOG_KEEP_MONTHS = 3
+
+# Optional: ecobee thermostat heat calls via beestat.io (free). With an API key
+# (beestat settings > Manage API Key), each scheduled check saves the ecobees'
+# 5-minute runtime records to pellet_watch_ecobee_YYYY-MM.csv, to match
+# against the boiler log. "" = off.
+BEESTAT_API_KEY = ""
+BEESTAT_URL = "https://api.beestat.io/"
 # ---------------------------------------------------------------------------
 
 SCRIPT_PATH = os.path.abspath(__file__)
@@ -126,6 +134,7 @@ HERE = os.path.dirname(SCRIPT_PATH)
 ICON_PATH = os.path.join(HERE, "pellets-icon.png")
 STATE_PATH = os.path.join(HERE, "pellet_watch_state.json")
 BACKUP_PATH = STATE_PATH + ".bak"
+BEESTAT_STATE_PATH = os.path.join(HERE, "pellet_watch_beestat.json")
 LOCK_PATH = os.path.join(HERE, "pellet_watch.lock")
 CONFIG_PATH = os.path.join(HERE, "pellet_watch_config.json")
 
@@ -141,7 +150,8 @@ SETTING_TYPES = {
     "ADVISORY": bool, "ADVISORY_COLD_OUTDOOR": (int, float),
     "ADVISORY_COLD_BOILER": (int, float), "ADVISORY_MILD_OUTDOOR": (int, float),
     "ADVISORY_MILD_BOILER": (int, float), "DEGREE_DAY_BASE": (int, float),
-    "LOG_SECONDS": int, "LOG_KEEP_MONTHS": int,
+    "LOG_SECONDS": int, "LOG_KEEP_MONTHS": int, "BEESTAT_API_KEY": str,
+    "BEESTAT_URL": str,
 }
 
 
@@ -1005,6 +1015,103 @@ class ResetHandler(BaseHTTPRequestHandler):
         sys.stdout.flush()
 
 
+ECOBEE_FIELDS = ["time_local", "time_utc", "thermostat_id", "thermostat",
+                 "heat_seconds", "fan_seconds", "indoor_f", "setpoint_heat_f",
+                 "outdoor_f", "system_mode", "climate", "event"]
+
+
+def beestat_call(resource, method, args=None):
+    q = {"api_key": BEESTAT_API_KEY, "resource": resource, "method": method}
+    if args is not None:
+        q["arguments"] = json.dumps(args)
+    url = BEESTAT_URL + "?" + urllib.parse.urlencode(q)
+    reply = json.loads(urllib.request.urlopen(url, timeout=60).read().decode("utf-8"))
+    if not reply.get("success"):
+        data = reply.get("data")
+        raise RuntimeError("beestat %s.%s failed: %s" % (
+            resource, method, data.get("error_message") if isinstance(data, dict)
+            else data))
+    return reply.get("data")
+
+
+def prune_logs(pattern):
+    logs = sorted(glob.glob(os.path.join(HERE, pattern)))
+    for old in logs[:-max(1, LOG_KEEP_MONTHS)]:
+        try:
+            os.remove(old)
+        except OSError:
+            pass
+
+
+def fetch_ecobee():
+    """Save new ecobee runtime records (5-minute rows) from beestat to
+    pellet_watch_ecobee_YYYY-MM.csv. Returns a short summary string."""
+    try:
+        with open(BEESTAT_STATE_PATH, encoding="utf-8") as f:
+            seen = json.load(f)
+    except (OSError, ValueError):
+        seen = {}
+    thermostats = beestat_call("thermostat", "read_id")
+    if isinstance(thermostats, dict):
+        thermostats = list(thermostats.values())
+    try:                                 # beestat syncs slowly when idle
+        beestat_call("thermostat", "sync")
+    except Exception:
+        pass
+    added = []
+    for th in thermostats:
+        tid = th.get("thermostat_id")
+        if tid is None:
+            continue
+        try:
+            beestat_call("runtime", "sync", {"thermostat_id": tid})
+        except Exception:
+            pass
+        since = seen.get(str(tid)) or time.strftime(
+            "%Y-%m-%d %H:%M:%S", time.gmtime(time.time() - 7 * 86400))
+        rows = beestat_call("runtime_thermostat", "read", {"attributes": {
+            "thermostat_id": tid, "timestamp": {"value": since, "operator": ">"}}})
+        if isinstance(rows, dict):
+            rows = list(rows.values())
+        rows = sorted(rows or [], key=lambda r: r.get("timestamp") or "")
+        n = 0
+        for r in rows:
+            ts = r.get("timestamp")
+            if not ts:
+                continue
+            utc = ts[:19].replace("T", " ")      # "2026-11-17T13:10:00+00:00"
+            try:
+                local = time.strftime("%Y-%m-%d %H:%M:%S",
+                                      time.localtime(_utc_epoch(utc)))
+            except ValueError:
+                continue
+            heat = (r.get("auxiliary_heat_1") or 0) + (r.get("auxiliary_heat_2") or 0)
+            row = [local, utc, tid, th.get("name"), heat, r.get("fan"),
+                   r.get("indoor_temperature"), r.get("setpoint_heat"),
+                   r.get("outdoor_temperature"), r.get("system_mode"),
+                   r.get("climate"), r.get("event")]
+            path = os.path.join(HERE, "pellet_watch_ecobee_%s.csv" % local[:7])
+            new = not os.path.exists(path)
+            with open(path, "a", newline="", encoding="utf-8") as f:
+                w = csv.writer(f)
+                if new:
+                    w.writerow(ECOBEE_FIELDS)
+                w.writerow(["" if v is None else v for v in row])
+            seen[str(tid)] = utc
+            n += 1
+        added.append("%s %d" % (th.get("name") or tid, n))
+    tmp = "%s.%d.tmp" % (BEESTAT_STATE_PATH, os.getpid())
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(seen, f, indent=2)
+    os.replace(tmp, BEESTAT_STATE_PATH)
+    prune_logs("pellet_watch_ecobee_????-??.csv")
+    return "ecobee records saved: " + ", ".join(added)
+
+
+def _utc_epoch(utc_text):
+    return calendar.timegm(time.strptime(utc_text, "%Y-%m-%d %H:%M:%S"))
+
+
 LOG_FIELDS = ["time", "outdoor_c", "boiler_c", "boiler_set_c", "chamber_c",
               "modulation", "state", "statetext", "burner_hours", "starts",
               "suggested_c"]
@@ -1027,13 +1134,7 @@ def log_once():
         if new:
             w.writerow(LOG_FIELDS)
         w.writerow(["" if v is None else v for v in row])
-    # Keep only the last LOG_KEEP_MONTHS months.
-    logs = sorted(glob.glob(os.path.join(HERE, "pellet_watch_log_????-??.csv")))
-    for old in logs[:-max(1, LOG_KEEP_MONTHS)]:
-        try:
-            os.remove(old)
-        except OSError:
-            pass
+    prune_logs("pellet_watch_log_????-??.csv")
 
 
 def logger_loop():
@@ -1087,7 +1188,14 @@ def main(argv=None):
             except ValueError:
                 raise SetupError("%r is not a number." % args.delivered)
             return run(True, value)
-        return run()
+        rc = run()
+        if BEESTAT_API_KEY and rc != 2:
+            # After the alert lines, so the alert stays first in the email.
+            try:
+                print(fetch_ecobee())
+            except Exception as e:       # never let beestat affect the check
+                print("beestat: %s" % str(e).replace(BEESTAT_API_KEY, "***"))
+        return rc
     except SetupError as e:
         print("Problem: %s" % e)
         return 2

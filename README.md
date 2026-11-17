@@ -84,6 +84,7 @@ Optional keys (defaults in brackets):
 | `LOG_KEEP_MONTHS` | Months of log files to keep [3] |
 | `WEATHER_UNIT` | Unit the boiler reports the online weather temperature in [`"C"`; `"F"` on imperial-unit boilers] |
 | `TEMP_FACTOR` | Units of the boiler's temperatures [0.1, i.e. tenths of a degree] |
+| `BEESTAT_API_KEY` | Optional: a [beestat.io](https://beestat.io) API key, to save your ecobee thermostats' heat-call records [off] |
 | `NTFY_TOPIC` | Optional phone push via [ntfy.sh](https://ntfy.sh): a hard-to-guess topic name [off] |
 
 Your settings live in the config file, so you can drop in a newer `pellet_watch.py` without re-entering anything. Misspelled settings are reported as a warning, and impossible ones (an order point above the hard stop, a port in quotes) stop the script with exit code 2.
@@ -240,6 +241,15 @@ Run `python3 pellet_watch.py --status` once to check the readings: the outdoor t
 ### Minute-by-minute log
 
 With `"LOG_SECONDS": 60`, the `--serve` process also logs a row every minute to `pellet_watch_log_YYYY-MM.csv` next to the script: outdoor temperature, boiler temperature and setpoint, combustion chamber temperature, modulation, boiler state, burner hours and starts, and the advisory setpoint. A week of this shows whether burns end because a zone stopped calling or because the boiler reached its switch-off temperature. Restart the `--serve` task after changing `LOG_SECONDS`. The log adds one request a minute to the boiler's JSON interface.
+
+### ecobee heat calls (optional, via beestat)
+
+The boiler can't tell you which zone asked for heat: every call arrives as the same burner contact. If your zones have ecobee thermostats, their records can. ecobee no longer issues API keys, but the free service [beestat.io](https://beestat.io) reads ecobee accounts and has its own API.
+
+1. Sign in at beestat.io with your ecobee account, then in beestat's settings, under **Manage API Key**, create a key. Anyone with the key can read your thermostat data, so keep it private.
+2. Add it to your config: `"BEESTAT_API_KEY": "your-key"`.
+
+Each scheduled check then asks beestat to sync and appends any new 5-minute records to `pellet_watch_ecobee_YYYY-MM.csv`: time, thermostat, seconds of heat call and fan in that 5 minutes, indoor temperature, heat setpoint, outdoor temperature and comfort setting (Home, Away, Sleep). The first run fetches the past week. Put that file next to the minute log, and every burn can be matched to a zone's call, or to none of them (hot water, or a zone without an ecobee). A beestat problem never changes the check's exit code; it's only noted in the output.
 
 ## Choosing your thresholds
 
