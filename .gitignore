@@ -10,3 +10,4 @@ __pycache__/
 pellet_watch.lock
 pellet_watch_state.json.bak
 *.tmp
+pellet_watch_log_*.csv

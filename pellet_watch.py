@@ -7,7 +7,12 @@ the boiler's local JSON interface, counts burner hours since the last pellet
 delivery, writes a status web page, and sends alerts: heads-ups on the way to
 the order point (by default at 1/4, 1/2 and 3/4 of it), then at the order point
 and the hard stop, with a daily reminder after that until the count is
-restarted. It also tracks burner cycling (starts per day, average burn length).
+restarted. It also tracks burner cycling (starts per day, average burn length), outdoor
+temperature from the boiler's online weather service (heating degree-days,
+burner hours per degree-day), and - advisory only - the boiler setpoint an
+outdoor-temperature curve would choose. In --serve mode it can also log the
+boiler's temperature and state every minute to a CSV file for analysis.
+Nothing is ever written to the boiler.
 
 Usage:
     python3 pellet_watch.py                  check, update the page, alert if due
@@ -31,6 +36,9 @@ DSM Task Scheduler can email you whenever the exit code is not 0.
 """
 
 import argparse
+import csv
+import glob
+import threading
 import html
 import json
 import math
@@ -90,6 +98,25 @@ REMINDER_HOUR = 8
 ORDER_URL = ""
 NTFY_TOPIC = ""                  # optional phone push: pick a hard-to-guess
                                  # topic name and subscribe to it in the ntfy app
+
+TEMP_UNIT = "C"                  # "C" or "F" for temperatures on the page
+TEMP_FACTOR = 0.1                # the JSON interface reports 0.1 degC units
+
+# Advisory outdoor reset (nothing is written to the boiler): the boiler
+# setpoint a straight-line curve would choose between these two points,
+# in degC. Defaults: 74 degC at -10 degC outside, 65 degC at +10 degC outside.
+# Check the lowest safe boiler temperature with your installer.
+ADVISORY = True
+ADVISORY_COLD_OUTDOOR = -10
+ADVISORY_COLD_BOILER = 74
+ADVISORY_MILD_OUTDOOR = 10
+ADVISORY_MILD_BOILER = 65
+DEGREE_DAY_BASE = 18.3           # degC (65 degF), for heating degree-days
+
+# Minute-by-minute log (boiler temperature, setpoint, state, modulation,
+# outdoor temperature) written by --serve to pellet_watch_log_YYYY-MM.csv.
+LOG_SECONDS = 0                  # 0 = off; 60 = once a minute
+LOG_KEEP_MONTHS = 3
 # ---------------------------------------------------------------------------
 
 SCRIPT_PATH = os.path.abspath(__file__)
@@ -107,7 +134,11 @@ SETTING_TYPES = {
     "FIRST_BASELINE": (int, float, type(None)), "HTML_PATH": (str, type(None)),
     "SERVE_PORT": int, "STALE_HOURS": (int, float), "MILESTONES": list,
     "DAILY_REMINDER": bool, "REMINDER_HOUR": int, "ORDER_URL": str,
-    "NTFY_TOPIC": str,
+    "NTFY_TOPIC": str, "TEMP_UNIT": str, "TEMP_FACTOR": (int, float),
+    "ADVISORY": bool, "ADVISORY_COLD_OUTDOOR": (int, float),
+    "ADVISORY_COLD_BOILER": (int, float), "ADVISORY_MILD_OUTDOOR": (int, float),
+    "ADVISORY_MILD_BOILER": (int, float), "DEGREE_DAY_BASE": (int, float),
+    "LOG_SECONDS": int, "LOG_KEEP_MONTHS": int,
 }
 
 
@@ -152,6 +183,12 @@ def load_config():
                              "[0.25, 0.5, 0.75]; got %r" % (g["MILESTONES"],))
     if not all(isinstance(m, int) and 1 <= m <= 12 for m in g["WINTER_MONTHS"]):
         raise SetupError("WINTER_MONTHS must be month numbers 1-12")
+    if g["TEMP_UNIT"] not in ("C", "F"):
+        raise SetupError('TEMP_UNIT must be "C" or "F"')
+    if g["ADVISORY_COLD_OUTDOOR"] >= g["ADVISORY_MILD_OUTDOOR"]:
+        raise SetupError("ADVISORY_COLD_OUTDOOR must be below ADVISORY_MILD_OUTDOOR")
+    if g["LOG_SECONDS"] and g["LOG_SECONDS"] < 30:
+        raise SetupError("LOG_SECONDS must be 0 (off) or at least 30")
 
 
 # ----------------------------- boiler --------------------------------------
@@ -170,7 +207,8 @@ def read_boiler_once():
         text = raw.decode("utf-8")
     except UnicodeDecodeError:
         text = raw.decode("latin-1")
-    pe1 = json.loads(text)["pe1"]
+    data = json.loads(text)
+    pe1 = data["pe1"]
     hours = _number(pe1["L_runtime"])
     if not math.isfinite(hours) or hours < 0:
         raise ValueError("boiler reported an invalid burner run time: %r" % hours)
@@ -180,12 +218,47 @@ def read_boiler_once():
             starts = None
     except (KeyError, ValueError, TypeError):
         starts = None
-    return hours, starts
+    weather = data.get("weather") or {}
+    extra = {
+        "outdoor": _temp(weather.get("L_temp"), -50, 50),
+        "boiler": _temp(pe1.get("L_temp_act"), -10, 120),
+        "boiler_set": _temp(pe1.get("L_temp_set"), 0, 120),
+        "chamber": _temp(pe1.get("L_frt_temp_act"), -10, 1200),
+        "modulation": _plain(pe1.get("L_modulation")),
+        "state": _plain(pe1.get("L_state")),
+        "statetext": _text(pe1.get("L_statetext")),
+    }
+    return hours, starts, extra
+
+
+def _plain(value):
+    try:
+        v = _number(value)
+        if not math.isfinite(v):
+            return None
+        return int(v) if v == int(v) else v
+    except (ValueError, TypeError):
+        return None
+
+
+def _temp(value, lo, hi):
+    """A temperature in degC from the boiler's 0.1-degree units, or None."""
+    v = _plain(value)
+    if v is None:
+        return None
+    v = round(v * TEMP_FACTOR, 1)
+    return v if lo <= v <= hi else None
+
+
+def _text(value):
+    if isinstance(value, dict):
+        value = value.get("val")
+    return None if value is None else str(value)[:60]
 
 
 def read_boiler(attempts=3, wait=10):
-    """(burner hours, burner starts or None). Retries, because the boiler's
-    JSON server is sometimes briefly busy (e.g. while the app polls it)."""
+    """(burner hours, burner starts or None, extra readings dict). Retries,
+    because the boiler's JSON server is sometimes briefly busy."""
     for i in range(attempts):
         try:
             return read_boiler_once()
@@ -364,11 +437,45 @@ def hours_per_day(history):
     return (h1 - h0) / days
 
 
+def suggested_setpoint(outdoor):
+    """Advisory boiler setpoint (degC) for an outdoor temperature (degC):
+    a straight line between the two ADVISORY points, flat beyond them."""
+    if outdoor is None or not ADVISORY:
+        return None
+    x0, y0 = ADVISORY_COLD_OUTDOOR, ADVISORY_COLD_BOILER
+    x1, y1 = ADVISORY_MILD_OUTDOOR, ADVISORY_MILD_BOILER
+    x = min(max(outdoor, x0), x1)
+    return round(y0 + (y1 - y0) * (x - x0) / (x1 - x0), 1)
+
+
+def fmt_temp(c, digits=0):
+    if c is None:
+        return "?"
+    if TEMP_UNIT == "F":
+        return "%.*f °F" % (digits, c * 9 / 5 + 32)
+    return "%.*f °C" % (digits, c)
+
+
+def degree_days(points):
+    """Heating degree-days (degC-days) across readings [t, ..., outdoor_c].
+    None if fewer than 2 readings have an outdoor temperature."""
+    pts = [p for p in points if len(p) > 3 and p[3] is not None]
+    if len(pts) < 2:
+        return None
+    total = 0.0
+    for a, b in zip(pts, pts[1:]):
+        dt = (b[0] - a[0]) / 86400.0
+        if 0 < dt <= 1.5:                # skip long gaps (e.g. NAS was off)
+            total += max(0.0, DEGREE_DAY_BASE - (a[3] + b[3]) / 2.0) * dt
+    return total
+
+
 def cycling_window(cycles, end_time, days=7):
     """Starts per day and average burn minutes for the `days` before end_time.
     None until at least a day of readings is available. Burner hours are
     whole numbers, so short windows are rough."""
-    pts = [c for c in cycles if c[2] is not None and c[0] <= end_time + 60]
+    pts = [c for c in cycles if len(c) > 2 and c[2] is not None
+           and c[0] <= end_time + 60]
     if len(pts) < 2:
         return None
     last = pts[-1]
@@ -379,8 +486,11 @@ def cycling_window(cycles, end_time, days=7):
     d_hours = last[1] - first[1]
     if span < 1.0 or d_starts <= 0 or d_hours < 0:
         return None
+    hdd = degree_days(window)
     return {"days": span, "starts_per_day": d_starts / span,
-            "avg_burn_min": d_hours * 60.0 / d_starts}
+            "avg_burn_min": d_hours * 60.0 / d_starts,
+            "hdd": hdd,
+            "hours_per_hdd": d_hours / hdd if hdd and hdd >= 1 else None}
 
 
 def cycling_rows(cycles, now_hours):
@@ -413,6 +523,49 @@ def cycling_rows(cycles, now_hours):
     rows.append("<tr><td>Burner starts (lifetime)</td><td>%s</td></tr>"
                 % format(starts, ",.0f"))
     return "<h2>Burner cycling</h2>\n<table>\n%s\n</table>" % "\n".join(rows)
+
+
+def weather_rows(extra, cycles):
+    """Outdoor temperature, degree-days and the advisory setpoint."""
+    if not extra:
+        return ""
+    rows = []
+    out = extra.get("outdoor")
+    if out is not None:
+        rows.append("<tr><td>Outdoor <span class='was'>(online weather)</span></td>"
+                    "<td>%s</td></tr>" % fmt_temp(out))
+    if extra.get("boiler") is not None:
+        rows.append("<tr><td>Boiler water now</td><td>%s</td></tr>"
+                    % fmt_temp(extra["boiler"]))
+    if extra.get("boiler_set") is not None:
+        rows.append("<tr><td>Boiler setpoint now</td><td>%s</td></tr>"
+                    % fmt_temp(extra["boiler_set"]))
+    sug = suggested_setpoint(out)
+    if sug is not None:
+        rows.append("<tr><td>Suggested setpoint <span class='was'>(advisory)</span>"
+                    "</td><td>%s</td></tr>" % fmt_temp(sug))
+    cur = prev = None
+    if cycles:
+        cur = cycling_window(cycles, cycles[-1][0])
+        prev = cycling_window(cycles, cycles[-1][0] - 7 * 86400)
+    if cur and cur.get("hdd") is not None and cur["days"] >= 1:
+        unit = 1.8 if TEMP_UNIT == "F" else 1.0          # degF-days
+        label = "last %d days" % round(cur["days"]) if cur["days"] >= 1.5 else "last day"
+        rows.append("<tr><td>Heating degree-days <span class='was'>(%s)</span></td>"
+                    "<td>%.0f</td></tr>" % (label, cur["hdd"] * unit))
+        if cur.get("hours_per_hdd"):
+            before = ""
+            if (prev and prev.get("hours_per_hdd") and cur["days"] >= 6
+                    and prev["days"] >= 6):
+                before = (" <span class='was'>(week before: %.2f)</span>"
+                          % (prev["hours_per_hdd"] / unit))
+            rows.append("<tr><td>Burner hours per degree-day</td><td>%.2f%s</td></tr>"
+                        % (cur["hours_per_hdd"] / unit, before))
+    if not rows:
+        return ""
+    note = ("<p class='hint'>The suggested setpoint is advisory only: nothing is "
+            "changed on the boiler.</p>" if sug is not None else "")
+    return "<h2>Weather</h2>\n<table>\n%s\n</table>%s" % ("\n".join(rows), note)
 
 
 def gauge_svg(used, order, stop):
@@ -501,7 +654,7 @@ td:last-child{text-align:right}
 """
 
 
-def render_page(now_hours, state, level, error=None):
+def render_page(now_hours, state, level, error=None, extra=None):
     """The whole status page as a string. With error set, shows it above the
     last known figures (or alone if there are none)."""
     order, stop, season = thresholds()
@@ -555,7 +708,8 @@ def render_page(now_hours, state, level, error=None):
          delivered_on, format(baseline, ",.0f"),
          season, format(baseline + order, ",.0f"), order,
          format(baseline + stop, ",.0f"), stop, eta,
-         cycling_rows(state.get("cycles", []), now_hours)))
+         cycling_rows(state.get("cycles", []), now_hours)
+         + weather_rows(extra, state.get("cycles", []))))
     checked = time.time()
     return """<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8">
@@ -611,7 +765,7 @@ def run(delivered=False, new_baseline=None):
             state = {"baseline": FIRST_BASELINE, "level": "ok", "history": []}
 
         try:
-            now_hours, starts = read_boiler()
+            now_hours, starts, extra = read_boiler()
         except Exception as e:
             print("Could not read the boiler: %s" % e)
             if delivered:
@@ -655,7 +809,7 @@ def run(delivered=False, new_baseline=None):
                             if h[0] >= now - 14 * 86400][-400:]
         if starts is not None:           # kept across deliveries for cycling
             state["cycles"] = [c for c in state.get("cycles", [])
-                               + [[now, now_hours, starts]]
+                               + [[now, now_hours, starts, extra.get("outdoor")]]
                                if c[0] >= now - 60 * 86400][-1500:]
 
         summary = ("%.0f burner hours used since the last delivery; %s order point "
@@ -664,7 +818,7 @@ def run(delivered=False, new_baseline=None):
         alert = pick_alert(state, used, order, stop, level)
         state["level"] = level
         save_state(state)
-        page_ok = write_page(render_page(now_hours, state, level))
+        page_ok = write_page(render_page(now_hours, state, level, extra=extra))
 
     if first_run and not delivered:
         print("First run: counting from %.0f h. If your last delivery was "
@@ -693,7 +847,7 @@ def status():
         print("No count yet: run pellet_watch.py once (or --delivered <hours>).")
         return 0
     try:
-        now_hours, _ = read_boiler(attempts=1)
+        now_hours, _, extra = read_boiler(attempts=1)
     except Exception as e:
         print("Could not read the boiler: %s" % e)
         return 2
@@ -705,6 +859,14 @@ def status():
           % ({"ok": "OK", "order": "ORDER", "stop": "OVERDUE"}[level], used,
              state["baseline"], season, order, stop, now_hours,
              ", ".join(state.get("notified", [])) or "none"))
+    sug = suggested_setpoint(extra.get("outdoor"))
+    print("Outdoor (online weather): %s. Boiler water %s, setpoint %s, state %s "
+          "(%s), modulation %s. Suggested setpoint (advisory): %s."
+          % (fmt_temp(extra.get("outdoor"), 1), fmt_temp(extra.get("boiler"), 1),
+             fmt_temp(extra.get("boiler_set"), 1), extra.get("statetext") or "?",
+             extra.get("state") if extra.get("state") is not None else "?",
+             "?" if extra.get("modulation") is None else "%.0f%%" % extra["modulation"],
+             fmt_temp(sug, 1)))
     return 0
 
 
@@ -821,7 +983,52 @@ class ResetHandler(BaseHTTPRequestHandler):
         sys.stdout.flush()
 
 
+LOG_FIELDS = ["time", "outdoor_c", "boiler_c", "boiler_set_c", "chamber_c",
+              "modulation", "state", "statetext", "burner_hours", "starts",
+              "suggested_c"]
+
+
+def log_once():
+    """Append one row of boiler readings to this month's CSV log."""
+    try:
+        hours, starts, extra = read_boiler(attempts=1)
+    except Exception:
+        return                           # skip this minute; try again next time
+    row = [time.strftime("%Y-%m-%d %H:%M:%S"), extra.get("outdoor"),
+           extra.get("boiler"), extra.get("boiler_set"), extra.get("chamber"),
+           extra.get("modulation"), extra.get("state"), extra.get("statetext"),
+           hours, starts, suggested_setpoint(extra.get("outdoor"))]
+    path = os.path.join(HERE, time.strftime("pellet_watch_log_%Y-%m.csv"))
+    new = not os.path.exists(path)
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        if new:
+            w.writerow(LOG_FIELDS)
+        w.writerow(["" if v is None else v for v in row])
+    # Keep only the last LOG_KEEP_MONTHS months.
+    logs = sorted(glob.glob(os.path.join(HERE, "pellet_watch_log_????-??.csv")))
+    for old in logs[:-max(1, LOG_KEEP_MONTHS)]:
+        try:
+            os.remove(old)
+        except OSError:
+            pass
+
+
+def logger_loop():
+    while True:
+        start = time.time()
+        try:
+            log_once()
+        except Exception as e:           # never let logging stop the server
+            print("Log error: %s" % e)
+        time.sleep(max(1.0, LOG_SECONDS - (time.time() - start)))
+
+
 def serve():
+    if LOG_SECONDS:
+        threading.Thread(target=logger_loop, daemon=True).start()
+        print("Logging boiler readings every %d s to %s" % (
+            LOG_SECONDS, os.path.join(HERE, "pellet_watch_log_YYYY-MM.csv")))
     server = _Server(("", SERVE_PORT), ResetHandler)
     server.daemon_threads = True
     print("Pellet watch: page and reset button on port %d" % SERVE_PORT)

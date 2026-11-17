@@ -7,6 +7,8 @@ Know when to order pellets for an **ÖkoFEN Pellematic** boiler, without extra h
 - shows a fuel-gauge status page you can add to your phone's home screen
 - alerts you (email or phone push) at a quarter, half and three-quarters of the way to the order point, then at the order point and the hard stop, with a daily reminder until the next delivery; the order point is earlier in winter
 - has a **"Pellets delivered?"** button on the page to restart the count after a refill
+- shows the **outdoor temperature** from the boiler's own online weather service (no outdoor sensor needed), heating degree-days and burner hours per degree-day, and an **advisory** boiler setpoint from an outdoor-temperature curve (nothing is ever written to the boiler)
+- can log the boiler's temperature, setpoint, state and modulation **every minute** to a CSV file, to see what's behind short burns
 - tracks **burner cycling**: starts per day and average burn length over the last week, compared with the week before (useful when tuning thermostats or boiler settings to reduce short cycling)
 
 <img src="docs/screenshot.png" width="320" alt="Status page with a fuel gauge, hours until the order point, and the Pellets delivered button">
@@ -73,6 +75,14 @@ Optional keys (defaults in brackets):
 | `MILESTONES` | Heads-up alerts as fractions of the order point, each sent once per delivery [`[0.25, 0.5, 0.75]`; `[]` = none] |
 | `DAILY_REMINDER` / `REMINDER_HOUR` | Repeat the alert daily after the order point, at the first check from this hour on [true / 8] |
 | `ORDER_URL` | Your supplier's ordering page: added to order alerts and shown as an "Order pellets" button on the page once it's time [none] |
+| `TEMP_UNIT` | `"C"` or `"F"` for temperatures on the page [`"C"`] |
+| `ADVISORY` | Show the advisory setpoint [true] |
+| `ADVISORY_COLD_OUTDOOR` / `ADVISORY_COLD_BOILER` | Curve point for cold weather, °C: boiler setpoint at this outdoor temperature [-10 / 74] |
+| `ADVISORY_MILD_OUTDOOR` / `ADVISORY_MILD_BOILER` | Curve point for mild weather, °C [10 / 65] |
+| `DEGREE_DAY_BASE` | Base for heating degree-days, °C [18.3, i.e. 65 °F] |
+| `LOG_SECONDS` | `--serve` logs boiler readings this often to `pellet_watch_log_YYYY-MM.csv` [0 = off; 60 = every minute] |
+| `LOG_KEEP_MONTHS` | Months of log files to keep [3] |
+| `TEMP_FACTOR` | Units of the boiler's temperatures [0.1, i.e. tenths of a degree] |
 | `NTFY_TOPIC` | Optional phone push via [ntfy.sh](https://ntfy.sh): a hard-to-guess topic name [off] |
 
 Your settings live in the config file, so you can drop in a newer `pellet_watch.py` without re-entering anything. Misspelled settings are reported as a warning, and impossible ones (an order point above the hard stop, a port in quotes) stop the script with exit code 2.
@@ -215,6 +225,20 @@ One line of output means it's running. From another computer, `http://YOUR-NAS:8
 A common mistake is to create only the button helper. Everything looks fine at first, but the page never updates and no alert is ever sent.
 
 **Email:** in DSM, **Control Panel → Notification → Email → Send a test email**. If that arrives, the pellet alert will too.
+
+## Weather, degree-days and the advisory setpoint
+
+The Pelletronic Touch fetches an online weather forecast for your location (Main menu → Weather), and the JSON interface reports its current temperature as `weather.L_temp`. pellet_watch uses that, so no outdoor sensor is needed. The page then shows:
+
+- **Outdoor temperature** and **heating degree-days** over the last week. Degree-days measure how cold it was: one degree below 65 °F for a whole day is one degree-day.
+- **Burner hours per degree-day**: burner hours divided by degree-days. Unlike pounds per burner hour, this measures efficiency fairly across mild and cold weeks, so it shows whether a change (thermostat settings, a buffer tank, a new boiler setting) actually helped.
+- **Suggested setpoint (advisory)**: the boiler temperature a simple outdoor-temperature curve would choose, alongside the boiler's actual setpoint. By default the curve runs from 74 °C at -10 °C outside to 65 °C at +10 °C outside. **Nothing is sent to the boiler.** It's there to collect evidence before you discuss outdoor reset with your installer, who should confirm the lowest safe boiler temperature for your system.
+
+Run `python3 pellet_watch.py --status` once to check the readings: the outdoor temperature should match the Weather page in the app, and the boiler temperature the app's boiler page. If they're out by a factor of ten, set `TEMP_FACTOR` to 1.
+
+### Minute-by-minute log
+
+With `"LOG_SECONDS": 60`, the `--serve` process also logs a row every minute to `pellet_watch_log_YYYY-MM.csv` next to the script: outdoor temperature, boiler temperature and setpoint, combustion chamber temperature, modulation, boiler state, burner hours and starts, and the advisory setpoint. A week of this shows whether burns end because a zone stopped calling or because the boiler reached its switch-off temperature. Restart the `--serve` task after changing `LOG_SECONDS`. The log adds one request a minute to the boiler's JSON interface.
 
 ## Choosing your thresholds
 

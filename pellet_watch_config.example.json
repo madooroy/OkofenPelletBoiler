@@ -3,16 +3,37 @@
   "JSON_PORT": 4321,
   "JSON_PASSWORD": "your-json-password",
   "HTML_PATH": "/volume1/web/pellets/pellets.html",
-  "WINTER_MONTHS": [10, 11, 12, 1, 2, 3, 4],
+  "WINTER_MONTHS": [
+    10,
+    11,
+    12,
+    1,
+    2,
+    3,
+    4
+  ],
   "WINTER_ORDER": 650,
   "WINTER_STOP": 700,
   "SUMMER_ORDER": 675,
   "SUMMER_STOP": 700,
-  "MILESTONES": [0.25, 0.5, 0.75],
+  "MILESTONES": [
+    0.25,
+    0.5,
+    0.75
+  ],
   "DAILY_REMINDER": true,
   "REMINDER_HOUR": 8,
   "ORDER_URL": "",
   "NTFY_TOPIC": "",
   "SERVE_PORT": 8765,
-  "STALE_HOURS": 13
+  "STALE_HOURS": 13,
+  "TEMP_UNIT": "F",
+  "ADVISORY": true,
+  "ADVISORY_COLD_OUTDOOR": -10,
+  "ADVISORY_COLD_BOILER": 74,
+  "ADVISORY_MILD_OUTDOOR": 10,
+  "ADVISORY_MILD_BOILER": 65,
+  "DEGREE_DAY_BASE": 18.3,
+  "LOG_SECONDS": 0,
+  "LOG_KEEP_MONTHS": 3
 }
