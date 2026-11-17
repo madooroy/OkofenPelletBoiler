@@ -1,6 +1,6 @@
 # Home Assistant version
 
-The same pellet reorder reminder as `pellet_watch.py`, built entirely in Home Assistant. Use this instead of the script if you already run HA.
+A simpler version of the pellet reorder reminder, built entirely in Home Assistant. It covers the core: hours since delivery, an order-point and hard-stop alert with a daily repeat, and a reset button. It does not have the script's heads-up alerts at 1/4, 1/2 and 3/4, the order link, or the burner cycling figures. Use it if you already run HA and want everything there.
 
 ## What you get
 
@@ -42,7 +42,7 @@ The order points live in the `order_point` and `hard_stop` attributes: 650 / 700
 
 ### 4. Restart and set your starting point
 
-Restart Home Assistant (Developer tools → YAML → Check configuration first). Then go to **Developer tools → Actions**, choose **Script: Pellets delivered**, enter your burner hours at the last delivery, and click **Perform action**.
+Restart Home Assistant (Developer tools → YAML → Check configuration first). Then go to **Developer tools → Actions**, choose **Script: Pellets delivered**, enter your burner hours at the last delivery, and click **Perform action**. Until you do, the pellet sensors show as unavailable and no alerts are sent.
 
 ### 5. Add the dashboard card
 

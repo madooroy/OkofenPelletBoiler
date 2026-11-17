@@ -46,7 +46,11 @@ template:
           {{ (states('sensor.pellet_burner_run_time') | float(0)
               - states('input_number.pellet_delivery_hours') | float(0))
              | round(0) | int }}
-        availability: "{{ states('sensor.pellet_burner_run_time') | is_number }}"
+        # Unavailable until the "Pellets delivered" script has been run once,
+        # so a fresh install doesn't raise a false OVERDUE alert.
+        availability: >
+          {{ states('sensor.pellet_burner_run_time') | is_number
+             and states('input_number.pellet_delivery_hours') | float(0) > 0 }}
         attributes:
           # Edit thresholds here: "<winter value> if <winter months> else <summer value>".
           # Winter = October through April.
@@ -86,6 +90,11 @@ script:
             mode: box
             unit_of_measurement: h
     sequence:
+      # Refuse to store 0 or a bad value if the boiler can't be read.
+      - condition: template
+        value_template: >
+          {{ (hours is defined and hours not in ['', none] and hours | float(0) > 0)
+             or states('sensor.pellet_burner_run_time') | is_number }}
       - action: input_number.set_value
         target:
           entity_id: input_number.pellet_delivery_hours
@@ -105,6 +114,8 @@ automation:
       - trigger: state
         entity_id: sensor.pellet_status
         to: [order, stop]
+        # Not after a restart or a brief outage (unavailable -> order).
+        not_from: [unavailable, unknown]
       - trigger: time
         at: "09:00:00"
     conditions:

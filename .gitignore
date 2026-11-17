@@ -5,3 +5,8 @@ pellet_watch_state.json.tmp
 pellets.html
 pellets.html.tmp
 __pycache__/
+
+# lock and backup files
+pellet_watch.lock
+pellet_watch_state.json.bak
+*.tmp

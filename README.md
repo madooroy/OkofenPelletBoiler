@@ -69,43 +69,58 @@ Optional keys (defaults in brackets):
 | `SUMMER_ORDER` / `SUMMER_STOP` | Summer order point / hard stop [675 / 700] |
 | `HTML_PATH` | Where to write the status page [`pellets.html` next to the script; `""` = none] |
 | `SERVE_PORT` | Port for the page's reset button and built-in web server [8765] |
+| `STALE_HOURS` | The page shows a warning if it hasn't been updated for this long [13] |
 | `MILESTONES` | Heads-up alerts as fractions of the order point, each sent once per delivery [`[0.25, 0.5, 0.75]`; `[]` = none] |
 | `DAILY_REMINDER` / `REMINDER_HOUR` | Repeat the alert daily after the order point, at the first check from this hour on [true / 8] |
 | `ORDER_URL` | Your supplier's ordering page: added to order alerts and shown as an "Order pellets" button on the page once it's time [none] |
 | `NTFY_TOPIC` | Optional phone push via [ntfy.sh](https://ntfy.sh): a hard-to-guess topic name [off] |
 
-Your settings live in the config file, so you can drop in a newer `pellet_watch.py` without re-entering anything.
+Your settings live in the config file, so you can drop in a newer `pellet_watch.py` without re-entering anything. Misspelled settings are reported as a warning, and impossible ones (an order point above the hard stop, a port in quotes) stop the script with exit code 2.
 
-Run it once by hand:
-
-```bash
-python3 pellet_watch.py
-```
-
-It prints something like `629 burner hours used since the last delivery; winter order point is 650 h, hard stop 700 h.`
-
-If your last delivery was earlier, tell it the reading from that day:
+Tell it the burner reading from your last delivery (or leave out the number to start counting from now):
 
 ```bash
 python3 pellet_watch.py --delivered 12543
 ```
 
+To check where things stand at any time without changing anything or using up an alert:
+
+```bash
+python3 pellet_watch.py --status
+```
+
+Use `--status` for checks by hand. A plain `python3 pellet_watch.py` is the scheduled check: if it crosses an alert point, that alert is printed to your terminal instead of being emailed.
+
 ## 3a. Synology NAS
 
-Put the files in the `web` shared folder (Web Station serves it as `http://YOUR-NAS/`). SSH in and test with `python3 /volume1/web/pellet_watch.py`.
+Keep the script and its config **out of** the `web` folder (anything in `web` can be read by any browser on your network, including the JSON password) and write only the page there:
+
+```
+scripts (shared folder)         web (Web Station's folder)
+└── pellet_watch                └── pellets
+    ├── pellet_watch.py             ├── pellets.html   (written by the script)
+    ├── pellet_watch_config.json    └── pellets-icon.png
+    ├── pellets-icon.png
+    └── (state files, created by the script)
+```
+
+1. In **Control Panel → Shared Folder**, create a shared folder called `scripts`. In File Station, make `scripts/pellet_watch` and `web/pellets`.
+2. Put `pellet_watch.py`, `pellets-icon.png` and your `pellet_watch_config.json` in `scripts/pellet_watch`, and **also copy `pellets-icon.png` into `web/pellets`** (the page looks for the icon next to itself).
+3. Add the page's location to your config: `"HTML_PATH": "/volume1/web/pellets/pellets.html"`
+4. SSH in and run `python3 /volume1/scripts/pellet_watch/pellet_watch.py --delivered <hours at your last delivery>`.
 
 In **Control Panel → Task Scheduler** create two tasks:
 
-1. **Scheduled Task → User-defined script**: daily or every few hours.
-   - Run command: `python3 /volume1/web/pellet_watch.py`
+1. **Scheduled Task → User-defined script**: every 6 hours (first run 00:00, last 18:00).
+   - Run command: `python3 /volume1/scripts/pellet_watch/pellet_watch.py`
    - Task Settings: tick **Send run details by email** and **only when the script terminates abnormally**. The script exits with an error code only on checks that raise an alert (each heads-up milestone, the order point, the hard stop, then once a day until you restart the count), so DSM emails you then and stays quiet otherwise. The first line of the email says which alert it is. (Control Panel → Notification → Email must be set up.)
-2. **Triggered Task → User-defined script**, Event **Boot-up**, user `root`.
-   - Run command: `python3 /volume1/web/pellet_watch.py --serve`
-   - Select it and click **Run** once to start it now. This powers the "Pellets delivered?" button.
+2. **Triggered Task → User-defined script**, Event **Boot-up**.
+   - Run command: `python3 /volume1/scripts/pellet_watch/pellet_watch.py --serve`
+   - Select it and click **Run** once to start it now. This powers the "Pellets delivered?" button. The button always runs the current `pellet_watch.py`, so updating the script doesn't need a restart; only a change to `SERVE_PORT` or `HTML_PATH` does.
 
-Page: `http://YOUR-NAS/pellets.html`. If the DSM firewall is on, allow port 8765 from your LAN.
+For both tasks, the safest user is a dedicated non-admin DSM account (e.g. `pelletwatch`) with read/write access to `scripts` and `web` only. `root` works but gives the script more access than it needs.
 
-> Anything in `web` can be fetched by a browser. If your NAS web server is reachable from the internet, keep the script and config in another shared folder and point `HTML_PATH` at the `web` folder.
+Page: `http://YOUR-NAS/pellets/pellets.html`. If the DSM firewall is on, allow port 8765 from your LAN. The button posts to plain `http://`, so open the page over `http://` too (an `https://` page will warn about or block the form).
 
 ## 3b. Raspberry Pi / Linux
 
@@ -157,19 +172,22 @@ Or from a terminal:
 ```bash
 python3 pellet_watch.py --delivered            # use the boiler's current reading
 python3 pellet_watch.py --delivered 13250      # or the reading on delivery day
+python3 pellet_watch.py --undo                 # undo the last restart
 ```
+
+Readings that can't be right (higher than the boiler's current reading, far in the past, or not a number) are refused. Each restart is logged in the state file with the old and new readings, which is what `--undo` uses.
 
 ## Check that it's working
 
-Run these on the machine running the script, from the script's folder (on a Synology NAS: `cd /volume1/web` after logging in with SSH).
+Run these on the machine running the script, from the script's folder (on a Synology NAS: `cd /volume1/scripts/pellet_watch` after logging in with SSH).
 
-**When the page was last updated:**
+**Current status, without changing anything:**
 
 ```bash
-grep -o 'Checked [0-9-]* [0-9:]*' pellets.html
+python3 pellet_watch.py --status
 ```
 
-With a check every 6 hours, this should never be more than 6 hours old.
+**When the page was last updated:** the bottom of the page says "Checked …". If the checks stop, the page shows a red warning once it's more than 13 hours old (`STALE_HOURS`).
 
 **Recent readings, with times:**
 
@@ -216,14 +234,14 @@ The page shows your measured burn rate (h/day) and an estimated "Order by" date 
 
 | Code | Meaning |
 |---|---|
-| 0 | Fine |
-| 1 | Alert on this check: a heads-up milestone, the order point, the hard stop, or the daily reminder after the order point |
-| 2 | Couldn't read the boiler |
+| 0 | Fine, nothing to report |
+| 1 | Alert on this check (a heads-up milestone, the order point, the hard stop, or the daily reminder after it), or the very first run |
+| 2 | A problem: the boiler couldn't be read after 3 tries, a setting is wrong, the state file is damaged (it is left untouched, with a `.bak` copy of the last good one), the page couldn't be written, or an unexpected error |
 
 ## Security notes
 
-- The reset button has no password: anyone on your home network who opens the page can press it. Don't forward its port to the internet.
-- The JSON password is in `pellet_watch_config.json`. Keep that file out of public web folders where possible.
+- The reset button has no password: anyone on your home network who opens the page can press it. It only accepts posts from a page on the same machine, refuses impossible readings, and logs every restart (`--undo` reverses one). Don't forward its port to the internet.
+- The JSON password is in `pellet_watch_config.json`. Keep that file out of any web folder (see the Synology layout above). It is never written to the page or to error messages.
 
 ## Credits
 

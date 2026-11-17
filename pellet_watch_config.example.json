@@ -2,11 +2,17 @@
   "BOILER_IP": "192.168.1.50",
   "JSON_PORT": 4321,
   "JSON_PASSWORD": "your-json-password",
-  "FIRST_BASELINE": null,
+  "HTML_PATH": "/volume1/web/pellets/pellets.html",
   "WINTER_MONTHS": [10, 11, 12, 1, 2, 3, 4],
   "WINTER_ORDER": 650,
   "WINTER_STOP": 700,
   "SUMMER_ORDER": 675,
   "SUMMER_STOP": 700,
-  "NTFY_TOPIC": ""
+  "MILESTONES": [0.25, 0.5, 0.75],
+  "DAILY_REMINDER": true,
+  "REMINDER_HOUR": 8,
+  "ORDER_URL": "",
+  "NTFY_TOPIC": "",
+  "SERVE_PORT": 8765,
+  "STALE_HOURS": 13
 }
