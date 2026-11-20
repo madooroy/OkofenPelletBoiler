@@ -25,14 +25,17 @@ Usage:
     python3 pellet_watch.py --undo           undo the last restart
     python3 pellet_watch.py --serve          keep running: serve the status page and
                                              its "Pellets delivered" button
+    python3 pellet_watch.py --test-notify    send a test email / ntfy push
 
 Exit codes:
-    0  fine, nothing to report
-    1  alert on this check (heads-up, order point, hard stop, daily reminder,
-       or the very first run), or a restart from the reset button
+    0  fine, nothing to report - or an alert that the script emailed itself
+       (SMTP_USER set and the email went out)
+    1  alert on this check that was NOT emailed by the script (heads-up, order
+       point, hard stop, daily reminder, or the very first run)
     2  problem: boiler unreachable, bad settings, damaged state file, page not
        written, or an unexpected error
-DSM Task Scheduler can email you whenever the exit code is not 0.
+DSM Task Scheduler can email you whenever the exit code is not 0; with
+SMTP_USER set, that DSM email then only comes for real problems.
 """
 
 import argparse
@@ -45,12 +48,16 @@ import json
 import math
 import os
 import shutil
+import smtplib
+import ssl
 import subprocess
 import sys
 import time
 import traceback
 import urllib.parse
 import urllib.request
+from email.message import EmailMessage
+from email.utils import formatdate, make_msgid
 from http.server import BaseHTTPRequestHandler
 
 try:                                     # Python 3.7+
@@ -99,6 +106,19 @@ REMINDER_HOUR = 8
 ORDER_URL = ""
 NTFY_TOPIC = ""                  # optional phone push: pick a hard-to-guess
                                  # topic name and subscribe to it in the ntfy app
+NTFY_SERVER = "https://ntfy.sh"
+
+# Optional: the script emails alerts itself, with a plain subject such as
+# "Time to order pellets". Needs an SMTP account that accepts an app password
+# (Yahoo, Gmail; NOT Outlook.com, which no longer allows passwords for SMTP).
+# When an alert email is sent, the check exits 0, so the DSM Task Scheduler
+# email is left for real problems only (exit code 2).
+SMTP_HOST = "smtp.mail.yahoo.com"
+SMTP_PORT = 465                  # 465 = SSL; 587 = STARTTLS
+SMTP_USER = ""                   # full address of the sending account; "" = off
+SMTP_PASSWORD = ""               # an app password, not the account password
+MAIL_TO = []                     # recipients; [] = send to SMTP_USER
+PAGE_URL = ""                    # status page address, linked in alerts
 
 TEMP_UNIT = "C"                  # "C" or "F" for temperatures on the page
 TEMP_FACTOR = 0.1                # the JSON interface reports 0.1-degree units
@@ -145,7 +165,9 @@ SETTING_TYPES = {
     "FIRST_BASELINE": (int, float, type(None)), "HTML_PATH": (str, type(None)),
     "SERVE_PORT": int, "STALE_HOURS": (int, float), "MILESTONES": list,
     "DAILY_REMINDER": bool, "REMINDER_HOUR": int, "ORDER_URL": str,
-    "NTFY_TOPIC": str, "TEMP_UNIT": str, "TEMP_FACTOR": (int, float),
+    "NTFY_TOPIC": str, "NTFY_SERVER": str, "SMTP_HOST": str, "SMTP_PORT": int,
+    "SMTP_USER": str, "SMTP_PASSWORD": str, "MAIL_TO": (list, str), "PAGE_URL": str,
+    "TEMP_UNIT": str, "TEMP_FACTOR": (int, float),
     "WEATHER_UNIT": str,
     "ADVISORY": bool, "ADVISORY_COLD_OUTDOOR": (int, float),
     "ADVISORY_COLD_BOILER": (int, float), "ADVISORY_MILD_OUTDOOR": (int, float),
@@ -202,6 +224,12 @@ def load_config():
         raise SetupError('WEATHER_UNIT must be "C" or "F"')
     if g["ADVISORY_COLD_OUTDOOR"] >= g["ADVISORY_MILD_OUTDOOR"]:
         raise SetupError("ADVISORY_COLD_OUTDOOR must be below ADVISORY_MILD_OUTDOOR")
+    if isinstance(g["MAIL_TO"], str):
+        g["MAIL_TO"] = [g["MAIL_TO"]] if g["MAIL_TO"] else []
+    if not all(isinstance(a, str) and "@" in a for a in g["MAIL_TO"]):
+        raise SetupError("MAIL_TO must be an email address or a list of them")
+    if g["SMTP_USER"] and not g["SMTP_PASSWORD"]:
+        raise SetupError("SMTP_USER is set but SMTP_PASSWORD is empty")
     if g["LOG_SECONDS"] and g["LOG_SECONDS"] < 30:
         raise SetupError("LOG_SECONDS must be 0 (off) or at least 30")
 
@@ -384,19 +412,73 @@ def check_baseline(new, reading):
 
 # ----------------------------- alerts --------------------------------------
 
-def push(title, message, click_url=""):
+def _ascii_header(text):
+    # HTTP headers must be latin-1; keep ntfy titles plain.
+    return text.replace("\u2013", "-").encode("latin-1", "replace").decode("latin-1")
+
+
+def push(title, message, click_url="", priority="high"):
+    """Phone push via ntfy. Returns True if sent, False if failed, None if off."""
     if not NTFY_TOPIC:
-        return
-    headers = {"Title": title, "Priority": "high", "Tags": "fire"}
+        return None
+    headers = {"Title": _ascii_header(title), "Priority": priority, "Tags": "fire"}
     if click_url:
         headers["Click"] = click_url     # tapping the notification opens it
+    if PAGE_URL:
+        headers["Actions"] = "view, Status page, %s" % PAGE_URL
     try:
         req = urllib.request.Request(
-            "https://ntfy.sh/" + urllib.parse.quote(NTFY_TOPIC, safe=""),
+            NTFY_SERVER.rstrip("/") + "/" + urllib.parse.quote(NTFY_TOPIC, safe=""),
             data=message.encode("utf-8"), headers=headers)
         urllib.request.urlopen(req, timeout=20)
+        return True
     except Exception as e:               # a failed push must not stop the check
         print("ntfy push failed: %s" % e)
+        return False
+
+
+def send_mail(subject, body):
+    """Email via SMTP. Returns True if sent, False if failed, None if off."""
+    if not SMTP_USER:
+        return None
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = "Pellet watch <%s>" % SMTP_USER
+    msg["To"] = ", ".join(MAIL_TO or [SMTP_USER])
+    msg["Date"] = formatdate(localtime=True)
+    msg["Message-ID"] = make_msgid(domain=SMTP_USER.split("@")[-1])
+    msg.set_content(body)
+    try:
+        context = ssl.create_default_context()
+        if SMTP_PORT == 465:
+            server = smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=30,
+                                      context=context)
+        else:
+            server = smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30)
+            server.starttls(context=context)
+        with server:
+            server.login(SMTP_USER, SMTP_PASSWORD)
+            server.send_message(msg)
+        return True
+    except Exception as e:               # report, never leak the password
+        text = str(e)
+        if SMTP_PASSWORD:
+            text = text.replace(SMTP_PASSWORD, "***")
+        print("Email failed: %s: %s" % (type(e).__name__, text))
+        return False
+
+
+def alert_text(alert, summary, url):
+    """Plain email body / push text for an alert."""
+    lines = [alert, ""]
+    if url:
+        lines.append("Order pellets: %s" % url)
+    if PAGE_URL:
+        lines.append("Status page: %s" % PAGE_URL)
+    if url or PAGE_URL:
+        lines.append("")
+    lines.append(summary)
+    return "\n".join(lines)
 
 
 def milestone_marks(order, stop):
@@ -857,18 +939,44 @@ def run(delivered=False, new_baseline=None):
         print(summary)
         return 1
     if alert:
-        # Headline first: it is the first line of the DSM Task Scheduler email.
         url = ORDER_URL if level in ("order", "stop") else ""
+        subject = alert.split(". ")[0].rstrip(".")      # first sentence
+        # Headline first: it is the first line of the DSM Task Scheduler email.
         print(alert)
         if url:
             print("Order pellets here: %s" % url)
         print(summary)
-        push(alert, summary, url)
-        return 1
+        mailed = send_mail(subject, alert_text(alert, summary, url))
+        push(subject, alert_text(alert, summary, ""), url)
+        if mailed:
+            print("Alert emailed to %s." % ", ".join(MAIL_TO or [SMTP_USER]))
+            return 0                     # our own email went out: no DSM email
+        return 1                         # no email of ours: let DSM send it
     print(summary)
     if delivered:
         push("Pellet count restarted", summary)
     return 0 if page_ok else 2
+
+
+def test_notify():
+    """Send a test email and push with the current settings."""
+    if not SMTP_USER and not NTFY_TOPIC:
+        print("Neither SMTP_USER nor NTFY_TOPIC is set; nothing to test.")
+        return 2
+    body = alert_text("This is a test from pellet_watch. If you can read it, "
+                      "alerts will reach you.", "No action needed.", ORDER_URL)
+    ok = True
+    mailed = send_mail("Pellet watch test", body)
+    if mailed is not None:
+        print("Email to %s: %s" % (", ".join(MAIL_TO or [SMTP_USER]),
+                                   "sent" if mailed else "FAILED"))
+        ok = ok and mailed
+    pushed = push("Pellet watch test", "Test push from pellet_watch.", ORDER_URL,
+                  priority="default")
+    if pushed is not None:
+        print("ntfy push to topic: %s" % ("sent" if pushed else "FAILED"))
+        ok = ok and pushed
+    return 0 if ok else 2
 
 
 def status():
@@ -1170,12 +1278,16 @@ def main(argv=None):
     g.add_argument("--undo", action="store_true", help="undo the last restart")
     g.add_argument("--serve", action="store_true",
                    help="serve the status page and its reset button")
+    g.add_argument("--test-notify", action="store_true",
+                   help="send a test email / ntfy push with the current settings")
     args = p.parse_args(argv)
     try:
         load_config()
         if args.serve:
             serve()
             return 0
+        if args.test_notify:
+            return test_notify()
         if args.status:
             return status()
         if args.undo:

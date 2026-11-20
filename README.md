@@ -86,6 +86,29 @@ Optional keys (defaults in brackets):
 | `TEMP_FACTOR` | Units of the boiler's temperatures [0.1, i.e. tenths of a degree] |
 | `BEESTAT_API_KEY` | Optional: a [beestat.io](https://beestat.io) API key, to save your ecobee thermostats' heat-call records [off] |
 | `NTFY_TOPIC` | Optional phone push via [ntfy.sh](https://ntfy.sh): a hard-to-guess topic name [off] |
+| `NTFY_SERVER` | ntfy server, if you run your own [`https://ntfy.sh`] |
+| `SMTP_USER` / `SMTP_PASSWORD` | Optional: the script emails alerts itself from this account, using an **app password** [off]. See [Email alerts](#email-alerts-optional) |
+| `SMTP_HOST` / `SMTP_PORT` | Mail server; port 465 uses SSL, 587 STARTTLS [`smtp.mail.yahoo.com` / 465; Gmail: `smtp.gmail.com` / 465] |
+| `MAIL_TO` | Who gets the alert emails: an address or a list [the sending account] |
+| `PAGE_URL` | Your status page's address, linked in alert emails and pushes [none] |
+
+### Email alerts (optional)
+
+DSM's Task Scheduler email wraps alerts in its own template ("Task Scheduler has completed a scheduled task", start/stop times, "Current status: 1 (Interrupted)"), which can't be changed. For a plain email with a subject like **"Time to order pellets - order point of 650 h reached"**, let the script send it:
+
+1. Create an **app password** for the sending account. Yahoo: Account security → Generate app password. Gmail: turn on 2-step verification, then myaccount.google.com/apppasswords. **Outlook.com / Hotmail won't work**: Microsoft no longer accepts passwords (including app passwords) for sending mail from scripts.
+2. Add to `pellet_watch_config.json`:
+   ```json
+   "SMTP_USER": "you@yahoo.com",
+   "SMTP_PASSWORD": "the-app-password",
+   "MAIL_TO": ["you@outlook.com"],
+   "PAGE_URL": "http://your-nas/pellets/pellets.html"
+   ```
+3. Test it: `python3 pellet_watch.py --test-notify` (sends a test email, and a test push if `NTFY_TOPIC` is set).
+
+When the email goes out, the check exits 0, so the DSM email is left for real problems only (boiler unreachable, bad settings). If the email fails, the check exits 1 as before and DSM still emails you.
+
+For a phone notification as well, install the **ntfy** app, subscribe to a hard-to-guess topic name, and set `NTFY_TOPIC` to the same name. Tapping the notification opens the order page; it also has a "Status page" button when `PAGE_URL` is set. Anyone who knows the topic name can read it, so don't use an obvious one.
 
 Your settings live in the config file, so you can drop in a newer `pellet_watch.py` without re-entering anything. Misspelled settings are reported as a warning, and impossible ones (an order point above the hard stop, a port in quotes) stop the script with exit code 2.
 
@@ -125,7 +148,7 @@ In **Control Panel → Task Scheduler** create two tasks:
 
 1. **Scheduled Task → User-defined script**: every 6 hours (first run 00:00, last 18:00).
    - Run command: `python3 /volume1/scripts/pellet_watch/pellet_watch.py`
-   - Task Settings: tick **Send run details by email** and **only when the script terminates abnormally**. The script exits with an error code only on checks that raise an alert (each heads-up milestone, the order point, the hard stop, then once a day until you restart the count), so DSM emails you then and stays quiet otherwise. The first line of the email says which alert it is. (Control Panel → Notification → Email must be set up.)
+   - Task Settings: tick **Send run details by email** and **only when the script terminates abnormally**. The script exits with an error code only on checks that raise an alert (each heads-up milestone, the order point, the hard stop, then once a day until you restart the count), so DSM emails you then and stays quiet otherwise. The first line of the email says which alert it is. With [script email alerts](#email-alerts-optional) set up, alerts come in the script's own plain email instead and DSM emails only on real problems. (Control Panel → Notification → Email must be set up.)
 2. **Triggered Task → User-defined script**, Event **Boot-up**.
    - Run command: `python3 /volume1/scripts/pellet_watch/pellet_watch.py --serve`
    - Select it and click **Run** once to start it now. This powers the "Pellets delivered?" button. The button always runs the current `pellet_watch.py`, so updating the script doesn't need a restart; only a change to `SERVE_PORT` or `HTML_PATH` does.
@@ -269,14 +292,14 @@ The page shows your measured burn rate (h/day) and an estimated "Order by" date 
 
 | Code | Meaning |
 |---|---|
-| 0 | Fine, nothing to report |
-| 1 | Alert on this check (a heads-up milestone, the order point, the hard stop, or the daily reminder after it), or the very first run |
+| 0 | Fine, nothing to report, or an alert the script emailed itself (`SMTP_USER` set) |
+| 1 | Alert on this check that the script did not email (a heads-up milestone, the order point, the hard stop, or the daily reminder after it), or the very first run |
 | 2 | A problem: the boiler couldn't be read after 3 tries, a setting is wrong, the state file is damaged (it is left untouched, with a `.bak` copy of the last good one), the page couldn't be written, or an unexpected error |
 
 ## Security notes
 
 - The reset button has no password: anyone on your home network who opens the page can press it. It only accepts posts from a page on the same machine, refuses impossible readings, and logs every restart (`--undo` reverses one). Don't forward its port to the internet.
-- The JSON password is in `pellet_watch_config.json`. Keep that file out of any web folder (see the Synology layout above). It is never written to the page or to error messages.
+- The JSON password, the email app password and the ntfy topic are in `pellet_watch_config.json`. Keep that file out of any web folder (see the Synology layout above). The passwords are never written to the page or to error messages. Use an app password, never your main account password; you can revoke it at any time.
 
 ## Credits
 
