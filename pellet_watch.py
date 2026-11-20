@@ -437,7 +437,7 @@ def push(title, message, click_url="", priority="high"):
         return False
 
 
-def send_mail(subject, body):
+def send_mail(subject, body, html_body=None):
     """Email via SMTP. Returns True if sent, False if failed, None if off."""
     if not SMTP_USER:
         return None
@@ -448,6 +448,8 @@ def send_mail(subject, body):
     msg["Date"] = formatdate(localtime=True)
     msg["Message-ID"] = make_msgid(domain=SMTP_USER.split("@")[-1])
     msg.set_content(body)
+    if html_body:
+        msg.add_alternative(html_body, subtype="html")
     try:
         context = ssl.create_default_context()
         if SMTP_PORT == 465:
@@ -466,6 +468,25 @@ def send_mail(subject, body):
             text = text.replace(SMTP_PASSWORD, "***")
         print("Email failed: %s: %s" % (type(e).__name__, text))
         return False
+
+
+def alert_html(alert, summary, url):
+    """HTML email body: the alert, link buttons, then the summary in grey."""
+    e = html.escape
+    button = ('<a href="%s" style="display:inline-block;padding:10px 18px;'
+              'margin:0 8px 8px 0;border-radius:6px;background:%s;color:#ffffff;'
+              'text-decoration:none;font-weight:bold">%s</a>')
+    links = ""
+    if url:
+        links += button % (e(url, quote=True), "#c0392b", "Order pellets")
+    if PAGE_URL:
+        links += button % (e(PAGE_URL, quote=True), "#2e7d4f", "Status page")
+    return ('<!DOCTYPE html><html><body style="font-family:Arial,Helvetica,sans-serif;'
+            'font-size:15px;line-height:1.5;color:#222">'
+            '<p style="font-size:17px;font-weight:bold;margin:0 0 14px">%s</p>'
+            '%s<p style="color:#666;font-size:13px;margin:10px 0 0">%s</p>'
+            '</body></html>') % (e(alert), "<p>%s</p>" % links if links else "",
+                                 e(summary))
 
 
 def alert_text(alert, summary, url):
@@ -946,7 +967,8 @@ def run(delivered=False, new_baseline=None):
         if url:
             print("Order pellets here: %s" % url)
         print(summary)
-        mailed = send_mail(subject, alert_text(alert, summary, url))
+        mailed = send_mail(subject, alert_text(alert, summary, url),
+                           alert_html(alert, summary, url))
         push(subject, alert_text(alert, summary, ""), url)
         if mailed:
             print("Alert emailed to %s." % ", ".join(MAIL_TO or [SMTP_USER]))
@@ -963,10 +985,12 @@ def test_notify():
     if not SMTP_USER and not NTFY_TOPIC:
         print("Neither SMTP_USER nor NTFY_TOPIC is set; nothing to test.")
         return 2
-    body = alert_text("This is a test from pellet_watch. If you can read it, "
-                      "alerts will reach you.", "No action needed.", ORDER_URL)
+    headline = ("This is a test from pellet_watch. If you can read it, "
+                "alerts will reach you.")
     ok = True
-    mailed = send_mail("Pellet watch test", body)
+    mailed = send_mail("Pellet watch test",
+                       alert_text(headline, "No action needed.", ORDER_URL),
+                       alert_html(headline, "No action needed.", ORDER_URL))
     if mailed is not None:
         print("Email to %s: %s" % (", ".join(MAIL_TO or [SMTP_USER]),
                                    "sent" if mailed else "FAILED"))
