@@ -95,17 +95,7 @@ Optional keys (defaults in brackets):
 | `MAIL_TO` | Who gets the alert emails: an address or a list [the sending account] |
 | `PAGE_URL` | Your status page's address, linked in alert emails and pushes [none] |
 
-#### Last winter's ecobee data (one-off)
-
-beestat keeps about 13 months of 5-minute ecobee records. To save the older ones before they expire:
-
-```bash
-python3 pellet_watch.py --ecobee-history 2025-11-01 2026-04-30
-```
-
-This writes `pellet_watch_ecobee_history_YYYY-MM.csv`, one file per month for all thermostats, in the same format as the regular ecobee files. Re-running rewrites them; they are never deleted automatically.
-
-## Email alerts (optional)
+### Email alerts (optional)
 
 DSM's Task Scheduler email wraps alerts in its own template ("Task Scheduler has completed a scheduled task", start/stop times, "Current status: 1 (Interrupted)"), which can't be changed. For a plain email with a subject like **"Time to order pellets - order point of 650 h reached"**, let the script send it:
 
@@ -286,6 +276,16 @@ The boiler can't tell you which zone asked for heat: every call arrives as the s
 2. Add it to your config: `"BEESTAT_API_KEY": "your-key"`.
 
 Each scheduled check then asks beestat to sync and appends any new 5-minute records to `pellet_watch_ecobee_YYYY-MM.csv`: time, thermostat, seconds of heat call and fan in that 5 minutes, indoor temperature, heat setpoint, outdoor temperature and comfort setting (Home, Away, Sleep). The first run fetches the past week. Put that file next to the minute log, and every burn can be matched to a zone's call, or to none of them (hot water, or a zone without an ecobee). A beestat problem never changes the check's exit code; it's only noted in the output.
+
+### Last winter's ecobee data (one-off)
+
+beestat keeps about 13 months of 5-minute ecobee records. To save the older ones before they expire:
+
+```bash
+python3 pellet_watch.py --ecobee-history 2025-11-01 2026-04-30
+```
+
+This writes `pellet_watch_ecobee_history_YYYY-MM.csv`, one file per month for all thermostats, in the same format as the regular ecobee files. Re-running rewrites them; they are never deleted automatically.
 
 ## Choosing your thresholds
 
