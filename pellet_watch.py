@@ -26,6 +26,8 @@ Usage:
     python3 pellet_watch.py --serve          keep running: serve the status page and
                                              its "Pellets delivered" button
     python3 pellet_watch.py --test-notify    send a test email / ntfy push
+    python3 pellet_watch.py --ecobee-history 2025-11-01 2026-04-30
+                                             one-off: save past ecobee records
 
 Exit codes:
     0  fine, nothing to report - or an alert that the script emailed itself
@@ -1263,6 +1265,9 @@ def fetch_ecobee():
             pass
         since = seen.get(str(tid)) or time.strftime(
             "%Y-%m-%d %H:%M:%S", time.gmtime(time.time() - 7 * 86400))
+        oldest = time.strftime("%Y-%m-%d %H:%M:%S",   # beestat max range: 31 days
+                               time.gmtime(time.time() - 30 * 86400))
+        since = max(since, oldest)
         rows = beestat_call("runtime_thermostat", "read", {"attributes": {
             "thermostat_id": tid, "timestamp": {"value": since, "operator": ">"}}})
         if isinstance(rows, dict):
@@ -1270,20 +1275,10 @@ def fetch_ecobee():
         rows = sorted(rows or [], key=lambda r: r.get("timestamp") or "")
         n = 0
         for r in rows:
-            ts = r.get("timestamp")
-            if not ts:
+            row = _ecobee_row(r, tid, th.get("name"))
+            if row is None:
                 continue
-            utc = ts[:19].replace("T", " ")      # "2026-11-17T13:10:00+00:00"
-            try:
-                local = time.strftime("%Y-%m-%d %H:%M:%S",
-                                      time.localtime(_utc_epoch(utc)))
-            except ValueError:
-                continue
-            heat = (r.get("auxiliary_heat_1") or 0) + (r.get("auxiliary_heat_2") or 0)
-            row = [local, utc, tid, th.get("name"), heat, r.get("fan"),
-                   r.get("indoor_temperature"), r.get("setpoint_heat"),
-                   r.get("outdoor_temperature"), r.get("system_mode"),
-                   r.get("climate"), r.get("event")]
+            local, utc = row[0], row[1]
             path = os.path.join(HERE, "pellet_watch_ecobee_%s.csv" % local[:7])
             new = not os.path.exists(path)
             with open(path, "a", newline="", encoding="utf-8") as f:
@@ -1300,6 +1295,89 @@ def fetch_ecobee():
     os.replace(tmp, BEESTAT_STATE_PATH)
     prune_logs("pellet_watch_ecobee_????-??.csv")
     return "ecobee records saved: " + ", ".join(added)
+
+
+def _ecobee_row(r, tid, name):
+    """One beestat runtime record as a CSV row (ECOBEE_FIELDS), or None."""
+    ts = r.get("timestamp")
+    if not ts:
+        return None
+    utc = ts[:19].replace("T", " ")      # "2026-11-17T13:10:00+00:00"
+    try:
+        local = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(_utc_epoch(utc)))
+    except ValueError:
+        return None
+    heat = (r.get("auxiliary_heat_1") or 0) + (r.get("auxiliary_heat_2") or 0)
+    return [local, utc, tid, name, heat, r.get("fan"),
+            r.get("indoor_temperature"), r.get("setpoint_heat"),
+            r.get("outdoor_temperature"), r.get("system_mode"),
+            r.get("climate"), r.get("event")]
+
+
+def ecobee_history(first_day, last_day):
+    """One-off download of past ecobee records (beestat keeps about 13 months)
+    into pellet_watch_ecobee_history_YYYY-MM.csv, one file per month, both
+    thermostats together. Files are rewritten, so re-running is safe; they
+    are never pruned. Does not touch the regular ecobee files."""
+    if not BEESTAT_API_KEY:
+        raise SetupError("BEESTAT_API_KEY is not set in the config file.")
+    try:
+        start = time.mktime(time.strptime(first_day, "%Y-%m-%d"))
+        end = time.mktime(time.strptime(last_day, "%Y-%m-%d")) + 86400
+    except ValueError:
+        raise SetupError("Dates must look like 2025-11-01.")
+    if end <= start:
+        raise SetupError("The second date must not be before the first.")
+    thermostats = beestat_call("thermostat", "read_id")
+    if isinstance(thermostats, dict):
+        thermostats = list(thermostats.values())
+    months, seen, counts = {}, set(), {}
+    fmt = lambda t: time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(t))
+    for th in thermostats:
+        tid = th.get("thermostat_id")
+        if tid is None:
+            continue
+        name = th.get("name") or str(tid)
+        counts[name] = 0
+        chunk = start
+        while chunk < end:               # a week per request keeps replies small
+            stop = min(chunk + 7 * 86400, end)
+            rows = beestat_call("runtime_thermostat", "read", {"attributes": {
+                "thermostat_id": tid,
+                "timestamp": {"value": [fmt(chunk), fmt(stop)],
+                              "operator": "between"}}})
+            if isinstance(rows, dict):
+                rows = list(rows.values())
+            for r in rows or []:
+                row = _ecobee_row(r, tid, name)
+                if row is None or (tid, row[1]) in seen:
+                    continue
+                if not (start <= _utc_epoch(row[1]) < end):
+                    continue
+                seen.add((tid, row[1]))
+                months.setdefault(row[0][:7], []).append(row)
+                counts[name] += 1
+            print("  %s: %s to %s done" % (name, time.strftime("%Y-%m-%d", time.localtime(chunk)),
+                                          time.strftime("%Y-%m-%d", time.localtime(stop - 1))))
+            sys.stdout.flush()
+            chunk = stop
+    for month, rows in sorted(months.items()):
+        rows.sort(key=lambda r: (r[0], str(r[2])))
+        path = os.path.join(HERE, "pellet_watch_ecobee_history_%s.csv" % month)
+        tmp = "%s.%d.tmp" % (path, os.getpid())
+        with open(tmp, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(ECOBEE_FIELDS)
+            for row in rows:
+                w.writerow(["" if v is None else v for v in row])
+        os.replace(tmp, path)
+        print("Wrote %s (%d rows)" % (os.path.basename(path), len(rows)))
+    if not months:
+        print("No ecobee records found for %s to %s (beestat keeps about "
+              "13 months)." % (first_day, last_day))
+        return 2
+    print("ecobee history saved: " + ", ".join("%s %d" % kv for kv in counts.items()))
+    return 0
 
 
 def _utc_epoch(utc_text):
@@ -1364,6 +1442,9 @@ def main(argv=None):
     g.add_argument("--undo", action="store_true", help="undo the last restart")
     g.add_argument("--serve", action="store_true",
                    help="serve the status page and its reset button")
+    g.add_argument("--ecobee-history", nargs=2, metavar=("FROM", "TO"),
+                   help="one-off: save past ecobee records from beestat, e.g. "
+                        "2025-11-01 2026-04-30")
     g.add_argument("--test-notify", action="store_true",
                    help="send a test email / ntfy push with the current settings")
     args = p.parse_args(argv)
@@ -1374,6 +1455,8 @@ def main(argv=None):
             return 0
         if args.test_notify:
             return test_notify()
+        if args.ecobee_history:
+            return ecobee_history(*args.ecobee_history)
         if args.status:
             return status()
         if args.undo:
