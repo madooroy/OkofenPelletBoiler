@@ -136,6 +136,17 @@ ADVISORY_MILD_OUTDOOR = 10
 ADVISORY_MILD_BOILER = 65
 DEGREE_DAY_BASE = 18.3           # degC (65 degF), for heating degree-days
 
+# Optional setpoint hint: a push (or email if no ntfy) when the advisory
+# setpoint, from the average outdoor temperature over the last few days, stays
+# at least SETPOINT_HINT_DIFF away from the boiler's current setpoint. You then
+# change it yourself; nothing is written to the boiler. At most one hint per
+# SETPOINT_HINT_DAYS days, and none again until the suggestion changes.
+SETPOINT_HINT = False
+SETPOINT_HINT_DIFF = 2.8         # K (2.8 K = 5 degF)
+SETPOINT_HINT_DAYS = 3           # days of outdoor temperature to average
+SETPOINT_HINT_MIN = None         # degC floor for hints, e.g. 68.3 (155 degF)
+                                 # so the hot-water tank still reheats well
+
 # Minute-by-minute log (boiler temperature, setpoint, state, modulation,
 # outdoor temperature) written by --serve to pellet_watch_log_YYYY-MM.csv.
 LOG_SECONDS = 0                  # 0 = off; 60 = once a minute
@@ -172,6 +183,8 @@ SETTING_TYPES = {
     "ADVISORY": bool, "ADVISORY_COLD_OUTDOOR": (int, float),
     "ADVISORY_COLD_BOILER": (int, float), "ADVISORY_MILD_OUTDOOR": (int, float),
     "ADVISORY_MILD_BOILER": (int, float), "DEGREE_DAY_BASE": (int, float),
+    "SETPOINT_HINT": bool, "SETPOINT_HINT_DIFF": (int, float),
+    "SETPOINT_HINT_DAYS": (int, float), "SETPOINT_HINT_MIN": (int, float, type(None)),
     "LOG_SECONDS": int, "LOG_KEEP_MONTHS": int, "BEESTAT_API_KEY": str,
     "BEESTAT_URL": str,
 }
@@ -582,6 +595,48 @@ def suggested_setpoint(outdoor):
     return round(y0 + (y1 - y0) * (x - x0) / (x1 - x0), 1)
 
 
+def setpoint_hint(state, extra, now=None):
+    """Return (title, message) when the boiler setpoint is worth changing by
+    hand, else None. Updates state["last_setpoint"] / state["setpoint_hint"]."""
+    now = now or time.time()
+    current = _setpoint(extra)
+    if current is not None:              # only known while the boiler heats
+        state["last_setpoint"] = current
+    current = state.get("last_setpoint")
+    if not (SETPOINT_HINT and ADVISORY) or current is None:
+        return None
+    days = SETPOINT_HINT_DAYS
+    pts = [c[3] for c in state.get("cycles", [])
+           if c[0] >= now - days * 86400 and len(c) > 3 and c[3] is not None]
+    if len(pts) < max(3, int(days * 4 * 0.75)):   # ~4 checks a day
+        return None
+    avg = sum(pts) / len(pts)
+    target = suggested_setpoint(avg)
+    if SETPOINT_HINT_MIN is not None:
+        target = max(target, SETPOINT_HINT_MIN)
+    if TEMP_UNIT == "F":                 # round to a 5 degF step
+        f = round((target * 9 / 5 + 32) / 5) * 5
+        target = round((f - 32) * 5 / 9, 1)
+    else:                                # or to a whole degC
+        target = float(round(target))
+    last = state.get("setpoint_hint") or {}
+    if abs(target - current) < SETPOINT_HINT_DIFF - 0.05:
+        state.pop("setpoint_hint", None)     # in line now: allow future hints
+        return None
+    if last.get("target") == target or now - last.get("time", 0) < days * 86400:
+        return None
+    state["setpoint_hint"] = {"target": target, "time": now}
+    word = "Milder" if target < current else "Colder"
+    title = "Boiler setpoint: consider %s" % fmt_temp(target)
+    msg = ("%s weather: outdoor has averaged %s over the last %g days. The "
+           "advisory curve suggests about %s (%.1f °C); the boiler is set to %s "
+           "(%.1f °C). To change it: myPelletronic > Pellematic 1 > Setting > "
+           "Control Temperature > %.1f. Advisory only; nothing was changed."
+           % (word, fmt_temp(avg), days, fmt_temp(target), target,
+              fmt_temp(current), current, target))
+    return title, msg
+
+
 def fmt_temp(c, digits=0):
     if c is None:
         return "?"
@@ -950,10 +1005,17 @@ def run(delivered=False, new_baseline=None):
                    "is %d h, hard stop %d h. Boiler reads %.0f h."
                    % (used, season.lower(), order, stop, now_hours))
         alert = pick_alert(state, used, order, stop, level)
+        hint = setpoint_hint(state, extra)
         state["level"] = level
         save_state(state)
         page_ok = write_page(render_page(now_hours, state, level, extra=extra))
 
+    if hint:
+        title, msg = hint
+        print(title + ". " + msg)
+        sent = push(title, msg, PAGE_URL, priority="default")
+        if not sent:                     # no ntfy (or it failed): email it
+            send_mail(title, msg)
     if first_run and not delivered:
         print("First run: counting from %.0f h. If your last delivery was "
               "earlier, run with --delivered <hours at delivery>." % state["baseline"])
