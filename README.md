@@ -88,6 +88,7 @@ Optional keys (defaults in brackets):
 | `WEATHER_UNIT` | Unit the boiler reports the online weather temperature in [`"C"`; `"F"` on imperial-unit boilers] |
 | `TEMP_FACTOR` | Units of the boiler's temperatures [0.1, i.e. tenths of a degree] |
 | `BEESTAT_API_KEY` | Optional: a [beestat.io](https://beestat.io) API key, to save your ecobee thermostats' heat-call records [off] |
+| `DATA_DIR` | Folder for the CSV logs (boiler log, ecobee files, ecobee history), relative to the script or a full path. Existing logs are moved into it on the next run [next to the script] |
 | `NTFY_TOPIC` | Optional phone push via [ntfy.sh](https://ntfy.sh): a hard-to-guess topic name [off] |
 | `NTFY_SERVER` | ntfy server, if you run your own [`https://ntfy.sh`] |
 | `SMTP_USER` / `SMTP_PASSWORD` | Optional: the script emails alerts itself from this account, using an **app password** [off]. See [Email alerts](#email-alerts-optional) |

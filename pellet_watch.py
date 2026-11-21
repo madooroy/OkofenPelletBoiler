@@ -153,6 +153,8 @@ SETPOINT_HINT_MIN = None         # degC floor for hints, e.g. 68.3 (155 degF)
 # outdoor temperature) written by --serve to pellet_watch_log_YYYY-MM.csv.
 LOG_SECONDS = 0                  # 0 = off; 60 = once a minute
 LOG_KEEP_MONTHS = 3
+DATA_DIR = ""                    # where the CSV logs go: "" = next to the script,
+                                 # or a folder name/path, e.g. "data"
 
 # Optional: ecobee thermostat heat calls via beestat.io (free). With an API key
 # (beestat settings > Manage API Key), each scheduled check saves the ecobees'
@@ -170,6 +172,7 @@ BACKUP_PATH = STATE_PATH + ".bak"
 BEESTAT_STATE_PATH = os.path.join(HERE, "pellet_watch_beestat.json")
 LOCK_PATH = os.path.join(HERE, "pellet_watch.lock")
 CONFIG_PATH = os.path.join(HERE, "pellet_watch_config.json")
+DATA_PATH = HERE                 # resolved from DATA_DIR by load_config()
 
 SETTING_TYPES = {
     "BOILER_IP": str, "JSON_PORT": int, "JSON_PASSWORD": str,
@@ -187,7 +190,8 @@ SETTING_TYPES = {
     "ADVISORY_MILD_BOILER": (int, float), "DEGREE_DAY_BASE": (int, float),
     "SETPOINT_HINT": bool, "SETPOINT_HINT_DIFF": (int, float),
     "SETPOINT_HINT_DAYS": (int, float), "SETPOINT_HINT_MIN": (int, float, type(None)),
-    "LOG_SECONDS": int, "LOG_KEEP_MONTHS": int, "BEESTAT_API_KEY": str,
+    "LOG_SECONDS": int, "LOG_KEEP_MONTHS": int, "DATA_DIR": str,
+    "BEESTAT_API_KEY": str,
     "BEESTAT_URL": str,
 }
 
@@ -222,6 +226,23 @@ def load_config():
         g[key] = value
     if g["HTML_PATH"] is None:
         g["HTML_PATH"] = os.path.join(HERE, "pellets.html")
+    g["DATA_PATH"] = os.path.join(HERE, g["DATA_DIR"]) if g["DATA_DIR"] else HERE
+    try:
+        os.makedirs(g["DATA_PATH"], exist_ok=True)
+    except OSError as e:
+        raise SetupError("Can't create DATA_DIR %s: %s" % (g["DATA_PATH"], e))
+    if os.path.realpath(g["DATA_PATH"]) != os.path.realpath(HERE):
+        # First run with DATA_DIR set: move existing CSV logs into it.
+        for pattern in ("pellet_watch_log_????-??.csv",
+                        "pellet_watch_ecobee_????-??.csv",
+                        "pellet_watch_ecobee_history_????-??.csv"):
+            for old in glob.glob(os.path.join(HERE, pattern)):
+                new = os.path.join(g["DATA_PATH"], os.path.basename(old))
+                if not os.path.exists(new):
+                    try:
+                        os.replace(old, new)
+                    except OSError:
+                        pass
     for season in ("WINTER", "SUMMER"):
         order, stop = g[season + "_ORDER"], g[season + "_STOP"]
         if not 0 < order < stop:
@@ -1231,7 +1252,7 @@ def beestat_call(resource, method, args=None):
 
 
 def prune_logs(pattern):
-    logs = sorted(glob.glob(os.path.join(HERE, pattern)))
+    logs = sorted(glob.glob(os.path.join(DATA_PATH, pattern)))
     for old in logs[:-max(1, LOG_KEEP_MONTHS)]:
         try:
             os.remove(old)
@@ -1279,7 +1300,7 @@ def fetch_ecobee():
             if row is None:
                 continue
             local, utc = row[0], row[1]
-            path = os.path.join(HERE, "pellet_watch_ecobee_%s.csv" % local[:7])
+            path = os.path.join(DATA_PATH, "pellet_watch_ecobee_%s.csv" % local[:7])
             new = not os.path.exists(path)
             with open(path, "a", newline="", encoding="utf-8") as f:
                 w = csv.writer(f)
@@ -1363,7 +1384,7 @@ def ecobee_history(first_day, last_day):
             chunk = stop
     for month, rows in sorted(months.items()):
         rows.sort(key=lambda r: (r[0], str(r[2])))
-        path = os.path.join(HERE, "pellet_watch_ecobee_history_%s.csv" % month)
+        path = os.path.join(DATA_PATH, "pellet_watch_ecobee_history_%s.csv" % month)
         tmp = "%s.%d.tmp" % (path, os.getpid())
         with open(tmp, "w", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
@@ -1399,7 +1420,7 @@ def log_once():
            extra.get("boiler"), extra.get("boiler_set"), extra.get("chamber"),
            extra.get("modulation"), extra.get("state"), extra.get("statetext"),
            hours, starts, suggested_setpoint(extra.get("outdoor"))]
-    path = os.path.join(HERE, time.strftime("pellet_watch_log_%Y-%m.csv"))
+    path = os.path.join(DATA_PATH, time.strftime("pellet_watch_log_%Y-%m.csv"))
     new = not os.path.exists(path)
     with open(path, "a", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
@@ -1423,7 +1444,7 @@ def serve():
     if LOG_SECONDS:
         threading.Thread(target=logger_loop, daemon=True).start()
         print("Logging boiler readings every %d s to %s" % (
-            LOG_SECONDS, os.path.join(HERE, "pellet_watch_log_YYYY-MM.csv")))
+            LOG_SECONDS, os.path.join(DATA_PATH, "pellet_watch_log_YYYY-MM.csv")))
     server = _Server(("", SERVE_PORT), ResetHandler)
     server.daemon_threads = True
     print("Pellet watch: page and reset button on port %d" % SERVE_PORT)

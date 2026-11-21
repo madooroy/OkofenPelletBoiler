@@ -46,6 +46,7 @@
   "SETPOINT_HINT_MIN": null,
   "LOG_SECONDS": 0,
   "LOG_KEEP_MONTHS": 3,
+  "DATA_DIR": "",
   "WEATHER_UNIT": "C",
   "BEESTAT_API_KEY": ""
 }
