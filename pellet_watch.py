@@ -26,6 +26,8 @@ Usage:
     python3 pellet_watch.py --serve          keep running: serve the status page and
                                              its "Pellets delivered" button
     python3 pellet_watch.py --test-notify    send a test email / ntfy push
+    python3 pellet_watch.py --ordered        pellets ordered: pause the daily
+                                             reminders until the delivery
     python3 pellet_watch.py --ecobee-history 2025-11-01 2026-04-30
                                              one-off: save past ecobee records
 
@@ -102,6 +104,9 @@ MILESTONES = [0.25, 0.5, 0.75]
 # After the order point or hard stop: repeat the alert once a day (at the first
 # check from this hour on) until the count is restarted. False = alert once.
 DAILY_REMINDER = True
+ORDERED_QUIET_DAYS = 14          # after "Pellets ordered", pause the daily
+                                 # reminders this long (then they resume, in
+                                 # case the delivery was never recorded)
 REMINDER_HOUR = 8
 # Your pellet supplier's ordering page. Added to order alerts (email and push)
 # and shown as a button on the status page once it's time to order. "" = none.
@@ -181,6 +186,7 @@ SETTING_TYPES = {
     "FIRST_BASELINE": (int, float, type(None)), "HTML_PATH": (str, type(None)),
     "SERVE_PORT": int, "STALE_HOURS": (int, float), "MILESTONES": list,
     "DAILY_REMINDER": bool, "REMINDER_HOUR": int, "ORDER_URL": str,
+    "ORDERED_QUIET_DAYS": (int, float),
     "NTFY_TOPIC": str, "NTFY_SERVER": str, "SMTP_HOST": str, "SMTP_PORT": int,
     "SMTP_USER": str, "SMTP_PASSWORD": str, "MAIL_TO": (list, str), "PAGE_URL": str,
     "TEMP_UNIT": str, "TEMP_FACTOR": (int, float),
@@ -565,8 +571,13 @@ def pick_alert(state, used, order, stop, level):
         new = [k for k in new if k in ("order", "stop")]
     today = time.strftime("%Y-%m-%d")
 
+    ordered = state.get("ordered")
     if "stop" in new:
         state["last_reminder"] = today
+        if ordered:                      # always sent, even after ordering
+            return ("Pellets OVERDUE - hard stop of %d h reached. Ordered on %s "
+                    "but not delivered yet: check on the delivery."
+                    % (stop, time.strftime("%b %d", time.localtime(ordered))))
         return ("Pellets OVERDUE - hard stop of %d h reached. Order now; the "
                 "hopper may run dry before they arrive." % stop)
     if "order" in new:
@@ -578,6 +589,14 @@ def pick_alert(state, used, order, stop, level):
     if (DAILY_REMINDER and level in ("order", "stop")
             and state.get("last_reminder") != today
             and time.localtime().tm_hour >= REMINDER_HOUR):
+        if ordered:
+            days = (time.time() - ordered) / 86400
+            if days < ORDERED_QUIET_DAYS:
+                return None              # ordered: no daily nagging
+            state["last_reminder"] = today
+            return ("Reminder: pellets ordered %.0f days ago but no delivery "
+                    "recorded (%.0f h used). Press \"Pellets delivered?\" on the "
+                    "status page once they arrive." % (days, used))
         state["last_reminder"] = today
         if level == "stop":
             return "Reminder: pellets OVERDUE (%.0f of %d h). Order now." % (used, stop)
@@ -812,6 +831,41 @@ def gauge_svg(used, order, stop):
         '</svg>'])
 
 
+def ordered_form(state, level):
+    """"Pellets ordered?" button (with a confirmation) past the order point,
+    or the "ordered" note with a button to take it back."""
+    if level not in ("order", "stop"):
+        return ""
+    ordered = state.get("ordered")
+    if ordered:
+        when = time.strftime("%b %d", time.localtime(ordered))
+        body = ('<p class="ordered">Ordered %s &ndash; daily reminders paused until '
+                'delivery.</p>'
+                '<form method="post" class="ordform" onsubmit="return confirm('
+                "'Resume the daily order reminders?')\">"
+                '<input type="hidden" name="action" value="cancel">'
+                '<input type="hidden" name="back" value="">'
+                '<button type="submit" class="small">Not ordered after all</button>'
+                '</form>' % when)
+    else:
+        body = ('<form method="post" class="ordform" onsubmit="return confirm('
+                "'Pellets ordered? This pauses the daily reminders until the "
+                "delivery is recorded. The hard-stop alert is still sent.')\">"
+                '<input type="hidden" name="action" value="yes">'
+                '<input type="hidden" name="back" value="">'
+                '<button type="submit">I\'ve ordered pellets</button></form>')
+    return body + """
+<script>
+(function () {
+  var fs = document.querySelectorAll("form.ordform");
+  for (var i = 0; i < fs.length; i++) {
+    fs[i].action = "http://" + location.hostname + ":%d/ordered";
+    fs[i].back.value = location.href;
+  }
+})();
+</script>""" % SERVE_PORT
+
+
 def reset_form(now_hours):
     """The "Pellets delivered" button. It posts to this script's --serve mode
     on SERVE_PORT of the same machine, which restarts the count and sends the
@@ -845,6 +899,10 @@ h2{font-size:1rem;font-weight:600;color:#9c9;margin:1.6rem 0 0}
 .was{color:#999;font-size:.85em}
 .orderbtn{display:block;text-align:center;margin:.8rem 0;padding:.8rem;border-radius:.5rem;
   background:#d99a00;color:#fff;font-weight:700;font-size:1.1rem;text-decoration:none}
+.ordered{text-align:center;color:#e0c060;margin:.4rem 0}
+form.ordform{text-align:center;margin:.4rem 0 .8rem}
+form.ordform button{padding:.6rem 1rem;border-radius:.5rem;border:0;background:#555;color:#fff;font-size:1rem}
+form.ordform button.small{padding:.3rem .7rem;font-size:.85rem;background:#444;color:#ccc}
 .badge{display:inline-block;padding:.3rem .8rem;border-radius:1rem;font-weight:700;color:#fff}
 .big{font-size:3rem;font-weight:700;margin:0 0 .3rem;text-align:center}
 .big span{font-size:1rem;font-weight:400;color:#aaa}
@@ -881,8 +939,10 @@ def render_page(now_hours, state, level, error=None, extra=None):
         left = order - used
         colors = {"ok": "#3a9a3a", "order": "#d99a00", "stop": "#c62828"}
         labels = {"ok": "OK", "order": "Order pellets", "stop": "OVERDUE - ORDER NOW"}
+        if state.get("ordered") and level in ("order", "stop"):
+            labels = dict(labels, order="Ordered", stop="OVERDUE - ordered")
         order_button = ""
-        if ORDER_URL and level in ("order", "stop"):
+        if ORDER_URL and level in ("order", "stop") and not state.get("ordered"):
             order_button = ('<a class="orderbtn" href="%s" target="_blank" '
                             'rel="noopener">Order pellets</a>'
                             % html.escape(ORDER_URL, quote=True))
@@ -914,7 +974,7 @@ def render_page(now_hours, state, level, error=None, extra=None):
 %s
 </table>
 %s""" % (colors[level], labels[level], gauge_svg(used, order, stop), used, stop,
-         order_button,
+         order_button + ordered_form(state, level),
          "%.0f h" % left if left > 0 else "now",
          " (last known)" if error else " now", format(now_hours, ",.0f"),
          delivered_on, format(baseline, ",.0f"),
@@ -997,13 +1057,15 @@ def run(delivered=False, new_baseline=None):
                  "new_baseline": new, "reading": now_hours,
                  "old_notified": state.get("notified"),
                  "old_level": state.get("level", "ok"),
-                 "old_last_reminder": state.get("last_reminder")})
+                 "old_last_reminder": state.get("last_reminder"),
+                 "old_ordered": state.get("ordered")})
             state["deliveries"] = state["deliveries"][-50:]
             state["baseline"] = new
             state["level"] = "ok"
             state["history"] = []
             state["notified"] = []
             state.pop("last_reminder", None)
+            state.pop("ordered", None)
             print("Count restarted. Baseline is now %.0f h; order at %.0f h."
                   % (new, new + thresholds()[0]))
         elif state.get("baseline") is None:
@@ -1119,6 +1181,36 @@ def status():
     return 0
 
 
+def set_ordered(on):
+    """Record (on=True) or cancel (on=False) that pellets have been ordered,
+    then run a normal check so the page shows it."""
+    with Lock():
+        state = load_state()
+        if state is None:
+            print("No count yet: run pellet_watch.py once first.")
+            return 2
+        if on:
+            if state.get("level", "ok") == "ok":
+                print("Not past the order point yet; nothing to pause.")
+                return 2
+            state["ordered"] = time.time()
+            msg = ("Marked as ordered. Daily reminders are paused until the "
+                   "delivery is recorded (or for %g days). The hard-stop alert "
+                   "is still sent." % ORDERED_QUIET_DAYS)
+        else:
+            if not state.pop("ordered", None):
+                print("Pellets were not marked as ordered.")
+                return 2
+            msg = "Order mark removed: daily reminders resume."
+        save_state(state)
+    print(msg)
+    try:
+        run()                            # refresh the page
+    except SetupError:
+        pass
+    return 0
+
+
 def undo():
     """Undo the last restart of the count."""
     with Lock():
@@ -1130,7 +1222,7 @@ def undo():
         last = deliveries.pop()
         state["baseline"] = last["old_baseline"]
         state["level"] = last.get("old_level", "ok")
-        for key in ("notified", "last_reminder"):
+        for key in ("notified", "last_reminder", "ordered"):
             if last.get("old_" + key) is None:
                 state.pop(key, None)
             else:
@@ -1181,7 +1273,8 @@ class ResetHandler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def do_POST(self):
-        if urllib.parse.urlsplit(self.path).path != "/reset":
+        path = urllib.parse.urlsplit(self.path).path
+        if path not in ("/reset", "/ordered"):
             return self._send(404, "Not found")
         # Only accept the form from a page on this same machine.
         host = self._host()
@@ -1198,18 +1291,25 @@ class ResetHandler(BaseHTTPRequestHandler):
         length = max(0, min(length, 1000))
         form = urllib.parse.parse_qs(self.rfile.read(length).decode("utf-8", "replace"))
         back_link = "<a href='javascript:history.back()'>Back</a>"
-        try:
-            hours = float(form.get("hours", [""])[0].replace(",", ""))
-            if not math.isfinite(hours) or hours <= 0:
-                raise ValueError
-        except ValueError:
-            return self._send(400, "<p>Please enter the burner hours as a number. %s</p>"
-                              % back_link)
+        if path == "/ordered":
+            action = form.get("action", [""])[0]
+            if action not in ("yes", "cancel"):
+                return self._send(400, "<p>Unknown action. %s</p>" % back_link)
+            command = ["--ordered", action]
+        else:
+            try:
+                hours = float(form.get("hours", [""])[0].replace(",", ""))
+                if not math.isfinite(hours) or hours <= 0:
+                    raise ValueError
+            except ValueError:
+                return self._send(400, "<p>Please enter the burner hours as a "
+                                  "number. %s</p>" % back_link)
+            command = ["--delivered", "%.0f" % hours]
         # Run the current version of the script (not the copy this server
         # loaded at startup), so updates take effect without a restart.
         try:
             proc = subprocess.run(
-                [sys.executable, SCRIPT_PATH, "--delivered", "%.0f" % hours],
+                [sys.executable, SCRIPT_PATH] + command,
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=150,
                 cwd=HERE)
             output = proc.stdout.decode("utf-8", "replace").strip()
@@ -1218,14 +1318,16 @@ class ResetHandler(BaseHTTPRequestHandler):
             output, ok = "Timed out waiting for the boiler.", False
         print(output)
         if not ok:
-            return self._send(400, "<p>The count was not restarted.</p><pre>%s</pre>"
-                              "<p>%s</p>" % (html.escape(output), back_link))
+            what = ("The order mark was not changed." if path == "/ordered"
+                    else "The count was not restarted.")
+            return self._send(400, "<p>%s</p><pre>%s</pre><p>%s</p>"
+                              % (what, html.escape(output), back_link))
 
         back = form.get("back", [""])[0]
         parts = urllib.parse.urlsplit(back)
         if parts.scheme not in ("http", "https") or (parts.hostname or "").lower() != host:
             back = "/pellets.html"
-        self._send(303, "<p>Count restarted.</p>", location=back)
+        self._send(303, "<p>Done.</p>", location=back)
 
     def log_message(self, fmt, *args):
         print("%s %s" % (self.address_string(), fmt % args))
@@ -1461,6 +1563,9 @@ def main(argv=None):
     g.add_argument("--delivered", nargs="?", const="now", metavar="HOURS",
                    help="restart the count (from HOURS, or the current reading)")
     g.add_argument("--undo", action="store_true", help="undo the last restart")
+    g.add_argument("--ordered", nargs="?", const="yes", choices=["yes", "cancel"],
+                   help="pellets ordered: pause the daily reminders until the "
+                        "delivery (--ordered cancel to resume them)")
     g.add_argument("--serve", action="store_true",
                    help="serve the status page and its reset button")
     g.add_argument("--ecobee-history", nargs=2, metavar=("FROM", "TO"),
@@ -1482,6 +1587,8 @@ def main(argv=None):
             return status()
         if args.undo:
             return undo()
+        if args.ordered:
+            return set_ordered(args.ordered == "yes")
         if args.delivered is not None:
             if args.delivered == "now":
                 return run(True, None)

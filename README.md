@@ -88,6 +88,7 @@ Optional keys (defaults in brackets):
 | `WEATHER_UNIT` | Unit the boiler reports the online weather temperature in [`"C"`; `"F"` on imperial-unit boilers] |
 | `TEMP_FACTOR` | Units of the boiler's temperatures [0.1, i.e. tenths of a degree] |
 | `BEESTAT_API_KEY` | Optional: a [beestat.io](https://beestat.io) API key, to save your ecobee thermostats' heat-call records [off] |
+| `ORDERED_QUIET_DAYS` | After you press **I've ordered pellets** on the page (or run `--ordered`), the daily reminders pause until the delivery is recorded, or for this many days, after which they resume. The hard-stop alert is always sent. `--ordered cancel` or **Not ordered after all** resumes them [14] |
 | `DATA_DIR` | Folder for the CSV logs (boiler log, ecobee files, ecobee history), relative to the script or a full path. Existing logs are moved into it on the next run [next to the script] |
 | `NTFY_TOPIC` | Optional phone push via [ntfy.sh](https://ntfy.sh): a hard-to-guess topic name [off] |
 | `NTFY_SERVER` | ntfy server, if you run your own [`https://ntfy.sh`] |

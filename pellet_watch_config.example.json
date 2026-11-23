@@ -23,6 +23,7 @@
   ],
   "DAILY_REMINDER": true,
   "REMINDER_HOUR": 8,
+  "ORDERED_QUIET_DAYS": 14,
   "ORDER_URL": "",
   "NTFY_TOPIC": "",
   "SMTP_USER": "",
