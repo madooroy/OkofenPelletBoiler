@@ -6,7 +6,7 @@ Know when to order pellets for an **ÖkoFEN Pellematic** boiler, without extra h
 
 - shows a fuel-gauge status page you can add to your phone's home screen
 - alerts you (email or phone push) at a quarter, half and three-quarters of the way to the order point, then at the order point and the hard stop, with a daily reminder until the next delivery; the order point is earlier in winter
-- has a **"Pellets delivered?"** button on the page to restart the count after a refill
+- has a **"Pellets delivered?"** button on the page to restart the count after a refill, and an **"I've ordered pellets"** button that pauses the daily reminders until the delivery
 - shows the **outdoor temperature** from the boiler's own online weather service (no outdoor sensor needed), heating degree-days and burner hours per degree-day, and an **advisory** boiler setpoint from an outdoor-temperature curve (nothing is ever written to the boiler)
 - can log the boiler's temperature, setpoint, state and modulation **every minute** to a CSV file, to see what's behind short burns
 - tracks **burner cycling**: starts per day and average burn length over the last week, compared with the week before (useful when tuning thermostats or boiler settings to reduce short cycling)
@@ -49,7 +49,7 @@ Put these files in one folder on the always-on machine:
 
 - `pellet_watch.py`
 - `pellets-icon.png`
-- `pellet_watch_config.json`: a copy of `pellet_watch_config.example.json`, renamed and edited
+- `pellet_watch_config.json`: a copy of `pellet_watch_config.example.json`, renamed and edited (the example is filled in for a Synology NAS and a boiler set to °F; the defaults in the settings table apply to anything you leave out)
 
 Minimum config:
 
@@ -80,7 +80,7 @@ Optional keys (defaults in brackets):
 | `ADVISORY_COLD_OUTDOOR` / `ADVISORY_COLD_BOILER` | Curve point for cold weather, °C: boiler setpoint at this outdoor temperature [-10 / 74] |
 | `ADVISORY_MILD_OUTDOOR` / `ADVISORY_MILD_BOILER` | Curve point for mild weather, °C [10 / 65] |
 | `DEGREE_DAY_BASE` | Base for heating degree-days, °C [18.3, i.e. 65 °F] |
-| `SETPOINT_HINT` | Push (or email, without ntfy) a suggestion to change the boiler's setpoint by hand when the advisory setpoint, from the last few days' average outdoor temperature, stays at least `SETPOINT_HINT_DIFF` away from it. Suggestions are rounded to 5 °F (or 1 °C); at most one per `SETPOINT_HINT_DAYS`, and not repeated until the suggestion changes [false] |
+| `SETPOINT_HINT` | Push (or email, without ntfy) a suggestion to change the boiler's setpoint by hand when the advisory setpoint, from the last few days' average outdoor temperature, stays at least `SETPOINT_HINT_DIFF` away from it. Suggestions are rounded to 5 °F (or 1 °C); at most one per `SETPOINT_HINT_DAYS`, and not repeated until the suggestion changes. Needs at least 3 checks a day (the 6-hourly check gives 4) [false] |
 | `SETPOINT_HINT_DIFF` / `SETPOINT_HINT_DAYS` | Difference that triggers a hint, K / days of outdoor temperature averaged [2.8 (5 °F) / 3] |
 | `SETPOINT_HINT_MIN` | Lowest setpoint a hint may suggest, °C, e.g. 68.3 (155 °F) so an indirect hot-water tank still reheats well [none] |
 | `LOG_SECONDS` | `--serve` logs boiler readings this often to `pellet_watch_log_YYYY-MM.csv` [0 = off; 60 = every minute] |
@@ -89,6 +89,7 @@ Optional keys (defaults in brackets):
 | `TEMP_FACTOR` | Units of the boiler's temperatures [0.1, i.e. tenths of a degree] |
 | `BEESTAT_API_KEY` | Optional: a [beestat.io](https://beestat.io) API key, to save your ecobee thermostats' heat-call records [off] |
 | `ORDERED_QUIET_DAYS` | After you press **I've ordered pellets** on the page (or run `--ordered`), the daily reminders pause until the delivery is recorded, or for this many days, after which they resume. The hard-stop alert is always sent. `--ordered cancel` or **Not ordered after all** resumes them [14] |
+| `ALLOWED_HOSTS` | Extra names the page server answers to, e.g. `["nas.local"]`. IP addresses, `localhost`, the machine's own name and the `PAGE_URL` host always work [none] |
 | `DATA_DIR` | Folder for the CSV logs (boiler log, ecobee files, ecobee history), relative to the script or a full path. Existing logs are moved into it on the next run [next to the script] |
 | `NTFY_TOPIC` | Optional phone push via [ntfy.sh](https://ntfy.sh): a hard-to-guess topic name [off] |
 | `NTFY_SERVER` | ntfy server, if you run your own [`https://ntfy.sh`] |
@@ -123,7 +124,7 @@ Tell it the burner reading from your last delivery (or leave out the number to s
 python3 pellet_watch.py --delivered 12543
 ```
 
-To check where things stand at any time without changing anything or using up an alert:
+To check where things stand at any time without using up an alert (it only creates `DATA_DIR` and moves old CSVs into it, like any run):
 
 ```bash
 python3 pellet_watch.py --status
@@ -156,7 +157,7 @@ In **Control Panel → Task Scheduler** create two tasks:
    - Task Settings: tick **Send run details by email** and **only when the script terminates abnormally**. The script exits with an error code only on checks that raise an alert (each heads-up milestone, the order point, the hard stop, then once a day until you restart the count), so DSM emails you then and stays quiet otherwise. The first line of the email says which alert it is. With [script email alerts](#email-alerts-optional) set up, alerts come in the script's own plain email instead and DSM emails only on real problems. (Control Panel → Notification → Email must be set up.)
 2. **Triggered Task → User-defined script**, Event **Boot-up**.
    - Run command: `python3 /volume1/scripts/pellet_watch/pellet_watch.py --serve`
-   - Select it and click **Run** once to start it now. This powers the "Pellets delivered?" button. The button always runs the current `pellet_watch.py`, so updating the script doesn't need a restart; only a change to `SERVE_PORT` or `HTML_PATH` does.
+   - Select it and click **Run** once to start it now. This powers the "Pellets delivered?" button. The buttons always run the current `pellet_watch.py`, so updating the script doesn't need a restart for them. The minute logger reloads the settings file when it changes. Restart this task after changing `SERVE_PORT`, `HTML_PATH`, `PAGE_URL` or `ALLOWED_HOSTS`, or after updating `pellet_watch.py` if you want the logger and the page server to run the new code.
 
 For both tasks, the safest user is a dedicated non-admin DSM account (e.g. `pelletwatch`) with read/write access to `scripts` and `web` only. `root` works but gives the script more access than it needs.
 
@@ -268,7 +269,7 @@ Run `python3 pellet_watch.py --status` once to check the readings: the outdoor t
 
 ### Minute-by-minute log
 
-With `"LOG_SECONDS": 60`, the `--serve` process also logs a row every minute to `pellet_watch_log_YYYY-MM.csv` next to the script: outdoor temperature, boiler temperature and setpoint, combustion chamber temperature, modulation, boiler state, burner hours and starts, and the advisory setpoint. A week of this shows whether burns end because a zone stopped calling or because the boiler reached its switch-off temperature. Restart the `--serve` task after changing `LOG_SECONDS`. The log adds one request a minute to the boiler's JSON interface.
+With `"LOG_SECONDS": 60`, the `--serve` process also logs a row every minute to `pellet_watch_log_YYYY-MM.csv` in `DATA_DIR` (next to the script if unset): outdoor temperature, boiler temperature and setpoint, combustion chamber temperature, modulation, boiler state, burner hours and starts, and the advisory setpoint. A week of this shows whether burns end because a zone stopped calling or because the boiler reached its switch-off temperature. Changes to `LOG_SECONDS`, `DATA_DIR` and the boiler settings are picked up within a minute. The log adds one request a minute to the boiler's JSON interface.
 
 ### ecobee heat calls (optional, via beestat)
 
@@ -313,7 +314,7 @@ The page shows your measured burn rate (h/day) and an estimated "Order by" date 
 
 ## Security notes
 
-- The reset button has no password: anyone on your home network who opens the page can press it. It only accepts posts from a page on the same machine, refuses impossible readings, and logs every restart (`--undo` reverses one). Don't forward its port to the internet.
+- The page buttons have no password: anyone on your home network who opens the page can press them. The server only answers requests addressed to this machine by an IP address, its own name, the `PAGE_URL` host or a name in `ALLOWED_HOSTS` (which blocks DNS-rebinding tricks), refuses cross-site and `Origin: null` posts, always redirects back to `PAGE_URL`, refuses impossible readings, and reports every restart by email and push (`--undo` reverses one). Don't forward its port to the internet.
 - The JSON password, the email app password and the ntfy topic are in `pellet_watch_config.json`. Keep that file out of any web folder (see the Synology layout above). The passwords are never written to the page or to error messages. Use an app password, never your main account password; you can revoke it at any time.
 
 ## Credits

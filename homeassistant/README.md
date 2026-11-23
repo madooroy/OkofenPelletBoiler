@@ -1,6 +1,6 @@
 # Home Assistant version
 
-A simpler version of the pellet reorder reminder, built entirely in Home Assistant. It covers the core: hours since delivery, an order-point and hard-stop alert with a daily repeat, and a reset button. It does not have the script's heads-up alerts at 1/4, 1/2 and 3/4, the order link, or the burner cycling figures. Use it if you already run HA and want everything there.
+A simpler version of the pellet reorder reminder, built entirely in Home Assistant. It covers the core: hours since delivery, an order-point and hard-stop alert with a daily repeat, and a reset button. It does not have the script's heads-up alerts at 1/4, 1/2 and 3/4, the order link, the "I've ordered pellets" pause, its own email alerts, or the burner cycling, weather and ecobee figures. Use it if you already run HA and want everything there.
 
 ## What you get
 

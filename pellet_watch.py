@@ -46,6 +46,8 @@ import argparse
 import calendar
 import csv
 import glob
+import ipaddress
+import socket
 import threading
 import html
 import json
@@ -126,6 +128,9 @@ SMTP_USER = ""                   # full address of the sending account; "" = off
 SMTP_PASSWORD = ""               # an app password, not the account password
 MAIL_TO = []                     # recipients; [] = send to SMTP_USER
 PAGE_URL = ""                    # status page address, linked in alerts
+ALLOWED_HOSTS = []               # extra names the page server may be reached
+                                 # by (IPs, localhost, this machine's name and
+                                 # the PAGE_URL host are always allowed)
 
 TEMP_UNIT = "C"                  # "C" or "F" for temperatures on the page
 TEMP_FACTOR = 0.1                # the JSON interface reports 0.1-degree units
@@ -188,7 +193,7 @@ SETTING_TYPES = {
     "DAILY_REMINDER": bool, "REMINDER_HOUR": int, "ORDER_URL": str,
     "ORDERED_QUIET_DAYS": (int, float),
     "NTFY_TOPIC": str, "NTFY_SERVER": str, "SMTP_HOST": str, "SMTP_PORT": int,
-    "SMTP_USER": str, "SMTP_PASSWORD": str, "MAIL_TO": (list, str), "PAGE_URL": str,
+    "SMTP_USER": str, "SMTP_PASSWORD": str, "MAIL_TO": (list, str), "PAGE_URL": str, "ALLOWED_HOSTS": list,
     "TEMP_UNIT": str, "TEMP_FACTOR": (int, float),
     "WEATHER_UNIT": str,
     "ADVISORY": bool, "ADVISORY_COLD_OUTDOOR": (int, float),
@@ -204,6 +209,23 @@ SETTING_TYPES = {
 
 class SetupError(Exception):
     """Settings or state that need fixing by hand. Exit code 2."""
+
+
+def _move_log(old, new):
+    """Move a CSV log into DATA_DIR. If the target exists (e.g. a server
+    started before DATA_DIR was set kept writing the old file), append the
+    rows instead of dropping them."""
+    try:
+        if not os.path.exists(new):
+            shutil.move(old, new)        # works across shared folders too
+            return
+        with open(old, newline="", encoding="utf-8") as src:
+            lines = src.readlines()[1:]  # skip the header
+        with open(new, "a", newline="", encoding="utf-8") as dst:
+            dst.writelines(lines)
+        os.remove(old)
+    except OSError as e:
+        print("Could not move %s to %s: %s" % (old, new, e))
 
 
 def load_config():
@@ -243,12 +265,7 @@ def load_config():
                         "pellet_watch_ecobee_????-??.csv",
                         "pellet_watch_ecobee_history_????-??.csv"):
             for old in glob.glob(os.path.join(HERE, pattern)):
-                new = os.path.join(g["DATA_PATH"], os.path.basename(old))
-                if not os.path.exists(new):
-                    try:
-                        os.replace(old, new)
-                    except OSError:
-                        pass
+                _move_log(old, os.path.join(g["DATA_PATH"], os.path.basename(old)))
     for season in ("WINTER", "SUMMER"):
         order, stop = g[season + "_ORDER"], g[season + "_STOP"]
         if not 0 < order < stop:
@@ -424,9 +441,15 @@ def save_state(state):
     tmp = "%s.%d.tmp" % (STATE_PATH, os.getpid())
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())             # on disk before the rename
     if os.path.exists(STATE_PATH):
         try:                             # keep the last good copy
-            shutil.copy2(STATE_PATH, BACKUP_PATH)
+            btmp = BACKUP_PATH + ".tmp"
+            shutil.copy2(STATE_PATH, btmp)
+            with open(btmp, "rb") as f:
+                os.fsync(f.fileno())
+            os.replace(btmp, BACKUP_PATH)
         except OSError:
             pass
     os.replace(tmp, STATE_PATH)
@@ -591,12 +614,18 @@ def pick_alert(state, used, order, stop, level):
             and time.localtime().tm_hour >= REMINDER_HOUR):
         if ordered:
             days = (time.time() - ordered) / 86400
+            when = time.strftime("%b %d", time.localtime(ordered))
+            if level == "stop":          # past the hard stop: never quiet
+                state["last_reminder"] = today
+                return ("Reminder: pellets OVERDUE (%.0f of %d h). Ordered %s but "
+                        "no delivery recorded: check on the delivery."
+                        % (used, stop, when))
             if days < ORDERED_QUIET_DAYS:
                 return None              # ordered: no daily nagging
             state["last_reminder"] = today
-            return ("Reminder: pellets ordered %.0f days ago but no delivery "
+            return ("Reminder: pellets ordered %s (%.0f days ago) but no delivery "
                     "recorded (%.0f h used). Press \"Pellets delivered?\" on the "
-                    "status page once they arrive." % (days, used))
+                    "status page once they arrive." % (when, days, used))
         state["last_reminder"] = today
         if level == "stop":
             return "Reminder: pellets OVERDUE (%.0f of %d h). Order now." % (used, stop)
@@ -654,20 +683,28 @@ def setpoint_hint(state, extra, now=None):
         return None
     avg = sum(pts) / len(pts)
     target = suggested_setpoint(avg)
-    if SETPOINT_HINT_MIN is not None:
-        target = max(target, SETPOINT_HINT_MIN)
-    if TEMP_UNIT == "F":                 # round to a 5 degF step
-        f = round((target * 9 / 5 + 32) / 5) * 5
-        target = round((f - 32) * 5 / 9, 1)
-    else:                                # or to a whole degC
-        target = float(round(target))
+    # Compare in the unit shown, after rounding, so 165 vs 160 degF counts as
+    # exactly 5 degF however the boiler rounds its degC value.
+    if TEMP_UNIT == "F":                 # 5 degF steps; floor rounded up
+        tgt = round((target * 9 / 5 + 32) / 5) * 5
+        if SETPOINT_HINT_MIN is not None:
+            tgt = max(tgt, math.ceil((SETPOINT_HINT_MIN * 9 / 5 + 32) / 5 - 1e-9) * 5)
+        cur = round(current * 9 / 5 + 32)
+        far = abs(tgt - cur) >= round(SETPOINT_HINT_DIFF * 9 / 5)
+        target = round((tgt - 32) * 5 / 9, 1)
+    else:                                # whole degC; floor rounded up
+        tgt = round(target)
+        if SETPOINT_HINT_MIN is not None:
+            tgt = max(tgt, math.ceil(SETPOINT_HINT_MIN - 1e-9))
+        far = abs(tgt - round(current)) >= round(SETPOINT_HINT_DIFF)
+        target = float(tgt)
     last = state.get("setpoint_hint") or {}
-    if abs(target - current) < SETPOINT_HINT_DIFF - 0.05:
+    if not far:
         state.pop("setpoint_hint", None)     # in line now: allow future hints
         return None
     if last.get("target") == target or now - last.get("time", 0) < days * 86400:
         return None
-    state["setpoint_hint"] = {"target": target, "time": now}
+    state["setpoint_hint"] = {"target": target, "time": now}   # undone if unsent
     word = "Milder" if target < current else "Colder"
     title = "Boiler setpoint: consider %s" % fmt_temp(target)
     msg = ("%s weather: outdoor has averaged %s over the last %g days. The "
@@ -1027,9 +1064,12 @@ def write_page(page):
 
 # ----------------------------- commands ------------------------------------
 
-def run(delivered=False, new_baseline=None):
+def run(delivered=False, new_baseline=None, interactive=False, attempts=3):
     """One check. With delivered=True, first restart the count from
-    new_baseline (or from the boiler's current reading when None)."""
+    new_baseline (or from the boiler's current reading when None).
+    interactive=True: started from the page or by hand, so no scheduler email
+    backs up a failed alert email; such an alert is kept as pending and the
+    next scheduled check repeats it."""
     with Lock():
         state = load_state()             # SetupError if damaged
         first_run = state is None
@@ -1037,7 +1077,7 @@ def run(delivered=False, new_baseline=None):
             state = {"baseline": FIRST_BASELINE, "level": "ok", "history": []}
 
         try:
-            now_hours, starts, extra = read_boiler()
+            now_hours, starts, extra = read_boiler(attempts=attempts)
         except Exception as e:
             print("Could not read the boiler: %s" % e)
             if delivered:
@@ -1090,22 +1130,16 @@ def run(delivered=False, new_baseline=None):
                    "is %d h, hard stop %d h. Boiler reads %.0f h."
                    % (used, season.lower(), order, stop, now_hours))
         alert = pick_alert(state, used, order, stop, level)
+        if not interactive:
+            pending = state.pop("pending_alert", None)
+            if pending and not alert:    # an earlier button press couldn't send it
+                alert = pending
         hint = setpoint_hint(state, extra)
         state["level"] = level
         save_state(state)
         page_ok = write_page(render_page(now_hours, state, level, extra=extra))
 
-    if hint:
-        title, msg = hint
-        print(title + ". " + msg)
-        sent = push(title, msg, PAGE_URL, priority="default")
-        if not sent:                     # no ntfy (or it failed): email it
-            send_mail(title, msg)
-    if first_run and not delivered:
-        print("First run: counting from %.0f h. If your last delivery was "
-              "earlier, run with --delivered <hours at delivery>." % state["baseline"])
-        print(summary)
-        return 1
+    rc = 0 if page_ok else 2
     if alert:
         url = ORDER_URL if level in ("order", "stop") else ""
         subject = alert.split(". ")[0].rstrip(".")      # first sentence
@@ -1119,12 +1153,42 @@ def run(delivered=False, new_baseline=None):
         push(subject, alert_text(alert, summary, ""), url)
         if mailed:
             print("Alert emailed to %s." % ", ".join(MAIL_TO or [SMTP_USER]))
-            return 0                     # our own email went out: no DSM email
-        return 1                         # no email of ours: let DSM send it
-    print(summary)
+            rc = 0                       # our own email went out: no DSM email
+        else:
+            rc = 1                       # no email of ours: let DSM send it
+            if interactive:              # ...but no DSM here: repeat it later
+                _update_state(lambda st: st.__setitem__("pending_alert", alert))
+                print("The alert email could not be sent; the next scheduled "
+                      "check will repeat it.")
+    else:
+        print(summary)
+    if first_run and not delivered:
+        print("First run: counting from %.0f h. If your last delivery was "
+              "earlier, run with --delivered <hours at delivery>." % state["baseline"])
+        rc = 1
     if delivered:
         push("Pellet count restarted", summary)
-    return 0 if page_ok else 2
+        send_mail("Pellet count restarted", summary)
+    if hint:                             # after the alert: alert stays first
+        title, msg = hint
+        print(title + ". " + msg)
+        sent = push(title, msg, PAGE_URL, priority="default")
+        if not sent:                     # no ntfy (or it failed): email it
+            sent = send_mail(title, msg)
+        if not sent:                     # undo the record so it is tried again
+            _update_state(lambda st: st.pop("setpoint_hint", None))
+    return rc
+
+
+def _update_state(change):
+    """Apply a small change to the saved state under the lock."""
+    try:
+        with Lock():
+            st = load_state()
+            if st is not None and change(st) is not False:
+                save_state(st)
+    except Exception as e:
+        print("Could not update the state file: %s" % e)
 
 
 def test_notify():
@@ -1204,11 +1268,13 @@ def set_ordered(on):
             msg = "Order mark removed: daily reminders resume."
         save_state(state)
     print(msg)
-    try:
-        run()                            # refresh the page
-    except SetupError:
-        pass
-    return 0
+    sys.stdout.flush()
+    try:                                 # refresh the page; one quick try
+        rc = run(interactive=True, attempts=1)
+    except Exception as e:
+        print("The mark is saved; the page updates at the next check (%s)." % e)
+        return 0
+    return 0                             # the mark itself was saved
 
 
 def undo():
@@ -1249,11 +1315,35 @@ class ResetHandler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def _host(self):
-        return (self.headers.get("Host") or "").rsplit(":", 1)[0].strip("[]").lower()
+        host = (self.headers.get("Host") or "").strip().lower()
+        if host.startswith("["):         # [IPv6]:port
+            return host[1:].split("]", 1)[0]
+        return host.rsplit(":", 1)[0] if host.count(":") == 1 else host
+
+    def _host_ok(self):
+        """Only names this machine is really reached by: an IP address,
+        localhost, its own hostname, or the PAGE_URL host. Blocks DNS
+        rebinding (a hostile site's name pointed at this machine)."""
+        host = self._host()
+        if not host:
+            return False
+        try:
+            ipaddress.ip_address(host)
+            return True
+        except ValueError:
+            pass
+        name = socket.gethostname().lower()
+        allowed = {"localhost", name, name.split(".")[0]}
+        if PAGE_URL:
+            allowed.add((urllib.parse.urlsplit(PAGE_URL).hostname or "").lower())
+        allowed.update(h.lower() for h in ALLOWED_HOSTS)
+        return host in allowed or host.split(".")[0] in allowed
 
     def do_GET(self):
         # Also serves the status page itself, so no other web server is needed
         # (e.g. on a Raspberry Pi): http://<this machine>:SERVE_PORT/
+        if not self._host_ok():
+            return self._send(403, "<p>Forbidden.</p>")
         path = urllib.parse.urlsplit(self.path).path
         files = {"/": (HTML_PATH, "text/html; charset=utf-8"),
                  "/pellets.html": (HTML_PATH, "text/html; charset=utf-8"),
@@ -1277,13 +1367,17 @@ class ResetHandler(BaseHTTPRequestHandler):
         if path not in ("/reset", "/ordered"):
             return self._send(404, "Not found")
         # Only accept the form from a page on this same machine.
+        if not self._host_ok():
+            return self._send(403, "<p>Forbidden.</p>")
         host = self._host()
         for header in ("Origin", "Referer"):
             value = self.headers.get(header)
-            if value and value != "null":
-                if (urllib.parse.urlsplit(value).hostname or "").lower() != host:
-                    return self._send(403, "<p>Forbidden.</p>")
-                break
+            if value is None:
+                continue
+            if value == "null" or (urllib.parse.urlsplit(value).hostname
+                                   or "").lower() != host:
+                return self._send(403, "<p>Forbidden.</p>")
+            break
         try:
             length = int(self.headers.get("Content-Length") or 0)
         except ValueError:
@@ -1323,11 +1417,8 @@ class ResetHandler(BaseHTTPRequestHandler):
             return self._send(400, "<p>%s</p><pre>%s</pre><p>%s</p>"
                               % (what, html.escape(output), back_link))
 
-        back = form.get("back", [""])[0]
-        parts = urllib.parse.urlsplit(back)
-        if parts.scheme not in ("http", "https") or (parts.hostname or "").lower() != host:
-            back = "/pellets.html"
-        self._send(303, "<p>Done.</p>", location=back)
+        # Back to the page; never to an address taken from the request.
+        self._send(303, "<p>Done.</p>", location=PAGE_URL or "/pellets.html")
 
     def log_message(self, fmt, *args):
         print("%s %s" % (self.address_string(), fmt % args))
@@ -1377,47 +1468,74 @@ def fetch_ecobee():
         beestat_call("thermostat", "sync")
     except Exception:
         pass
-    added = []
-    for th in thermostats:
-        tid = th.get("thermostat_id")
-        if tid is None:
-            continue
-        try:
-            beestat_call("runtime", "sync", {"thermostat_id": tid})
-        except Exception:
-            pass
-        since = seen.get(str(tid)) or time.strftime(
-            "%Y-%m-%d %H:%M:%S", time.gmtime(time.time() - 7 * 86400))
-        oldest = time.strftime("%Y-%m-%d %H:%M:%S",   # beestat max range: 31 days
-                               time.gmtime(time.time() - 30 * 86400))
-        since = max(since, oldest)
-        rows = beestat_call("runtime_thermostat", "read", {"attributes": {
-            "thermostat_id": tid, "timestamp": {"value": since, "operator": ">"}}})
-        if isinstance(rows, dict):
-            rows = list(rows.values())
-        rows = sorted(rows or [], key=lambda r: r.get("timestamp") or "")
-        n = 0
-        for r in rows:
-            row = _ecobee_row(r, tid, th.get("name"))
-            if row is None:
+    added, failed = [], []
+    try:
+        for th in thermostats:
+            tid = th.get("thermostat_id")
+            if tid is None:
                 continue
-            local, utc = row[0], row[1]
-            path = os.path.join(DATA_PATH, "pellet_watch_ecobee_%s.csv" % local[:7])
-            new = not os.path.exists(path)
-            with open(path, "a", newline="", encoding="utf-8") as f:
-                w = csv.writer(f)
-                if new:
-                    w.writerow(ECOBEE_FIELDS)
-                w.writerow(["" if v is None else v for v in row])
-            seen[str(tid)] = utc
-            n += 1
-        added.append("%s %d" % (th.get("name") or tid, n))
-    tmp = "%s.%d.tmp" % (BEESTAT_STATE_PATH, os.getpid())
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(seen, f, indent=2)
-    os.replace(tmp, BEESTAT_STATE_PATH)
+            try:
+                added.append(_fetch_one(th, tid, seen))
+            except Exception as e:
+                failed.append("%s (%s)" % (th.get("name") or tid,
+                                           str(e).replace(BEESTAT_API_KEY, "***")))
+    finally:                             # save progress even if one failed
+        tmp = "%s.%d.tmp" % (BEESTAT_STATE_PATH, os.getpid())
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(seen, f, indent=2)
+        os.replace(tmp, BEESTAT_STATE_PATH)
     prune_logs("pellet_watch_ecobee_????-??.csv")
+    if failed:
+        raise RuntimeError("saved %s; failed: %s" % (", ".join(added) or "nothing",
+                                                     ", ".join(failed)))
     return "ecobee records saved: " + ", ".join(added)
+
+
+def _fetch_one(th, tid, seen):
+    """New records for one thermostat; updates seen. Returns 'name n'."""
+    try:
+        beestat_call("runtime", "sync", {"thermostat_id": tid})
+    except Exception:
+        pass
+    since = seen.get(str(tid)) or time.strftime(
+        "%Y-%m-%d %H:%M:%S", time.gmtime(time.time() - 7 * 86400))
+    oldest = time.strftime("%Y-%m-%d %H:%M:%S",   # beestat max range: 31 days
+                           time.gmtime(time.time() - 30 * 86400))
+    since = max(since, oldest)
+    rows = beestat_call("runtime_thermostat", "read", {"attributes": {
+        "thermostat_id": tid, "timestamp": {"value": since, "operator": ">"}}})
+    if isinstance(rows, dict):
+        rows = list(rows.values())
+    rows = sorted(rows or [], key=lambda r: r.get("timestamp") or "")
+    n = 0
+    for r in rows:
+        row = _ecobee_row(r, tid, th.get("name"))
+        if row is None:
+            continue
+        local, utc = row[0], row[1]
+        path = os.path.join(DATA_PATH, "pellet_watch_ecobee_%s.csv" % local[:7])
+        new = not os.path.exists(path)
+        with open(path, "a", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            if new:
+                w.writerow(ECOBEE_FIELDS)
+            w.writerow(["" if v is None else v for v in row])
+        seen[str(tid)] = utc
+        n += 1
+    return "%s %d" % (th.get("name") or tid, n)
+
+
+def _beestat_failures(reset=False):
+    """Count consecutive beestat failures in the state file; returns the count."""
+    n = [0]
+
+    def change(st):
+        if reset:
+            return False if st.pop("beestat_failures", None) is None else None
+        n[0] = st.get("beestat_failures", 0) + 1
+        st["beestat_failures"] = n[0]
+    _update_state(change)
+    return n[0]
 
 
 def _ecobee_row(r, tid, name):
@@ -1454,7 +1572,7 @@ def ecobee_history(first_day, last_day):
     thermostats = beestat_call("thermostat", "read_id")
     if isinstance(thermostats, dict):
         thermostats = list(thermostats.values())
-    months, seen, counts = {}, set(), {}
+    months, seen, counts, failure = {}, set(), {}, None
     fmt = lambda t: time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(t))
     for th in thermostats:
         tid = th.get("thermostat_id")
@@ -1465,10 +1583,22 @@ def ecobee_history(first_day, last_day):
         chunk = start
         while chunk < end:               # a week per request keeps replies small
             stop = min(chunk + 7 * 86400, end)
-            rows = beestat_call("runtime_thermostat", "read", {"attributes": {
+            args = {"attributes": {
                 "thermostat_id": tid,
                 "timestamp": {"value": [fmt(chunk), fmt(stop)],
-                              "operator": "between"}}})
+                              "operator": "between"}}}
+            for attempt in range(4):     # beestat rate-limits bursts
+                try:
+                    rows = beestat_call("runtime_thermostat", "read", args)
+                    break
+                except Exception as e:
+                    if attempt == 3:
+                        failure = str(e).replace(BEESTAT_API_KEY, "***")
+                        rows = None
+                        break
+                    time.sleep(15 * (attempt + 1))
+            if rows is None:
+                break
             if isinstance(rows, dict):
                 rows = list(rows.values())
             for r in rows or []:
@@ -1484,9 +1614,15 @@ def ecobee_history(first_day, last_day):
                                           time.strftime("%Y-%m-%d", time.localtime(stop - 1))))
             sys.stdout.flush()
             chunk = stop
+        if failure:
+            break
     for month, rows in sorted(months.items()):
         rows.sort(key=lambda r: (r[0], str(r[2])))
         path = os.path.join(DATA_PATH, "pellet_watch_ecobee_history_%s.csv" % month)
+        if failure and os.path.exists(path):
+            print("Kept the existing %s (this run is incomplete)"
+                  % os.path.basename(path))
+            continue
         tmp = "%s.%d.tmp" % (path, os.getpid())
         with open(tmp, "w", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
@@ -1495,6 +1631,11 @@ def ecobee_history(first_day, last_day):
                 w.writerow(["" if v is None else v for v in row])
         os.replace(tmp, path)
         print("Wrote %s (%d rows)" % (os.path.basename(path), len(rows)))
+    if failure:
+        print("beestat stopped answering (%s). Months above may be partial: run "
+              "the same command again later; complete files replace them."
+              % failure)
+        return 2
     if not months:
         print("No ecobee records found for %s to %s (beestat keeps about "
               "13 months)." % (first_day, last_day))
@@ -1532,9 +1673,24 @@ def log_once():
     prune_logs("pellet_watch_log_????-??.csv")
 
 
+def _config_mtime():
+    try:
+        return os.path.getmtime(CONFIG_PATH)
+    except OSError:
+        return None
+
+
 def logger_loop():
+    seen = _config_mtime()
     while True:
         start = time.time()
+        now = _config_mtime()
+        if now != seen:                  # settings changed: pick them up
+            seen = now
+            try:
+                load_config()
+            except SetupError as e:
+                print("Settings file has a problem, keeping the old settings: %s" % e)
         try:
             log_once()
         except Exception as e:           # never let logging stop the server
@@ -1591,19 +1747,26 @@ def main(argv=None):
             return set_ordered(args.ordered == "yes")
         if args.delivered is not None:
             if args.delivered == "now":
-                return run(True, None)
+                return run(True, None, interactive=True)
             try:
                 value = float(args.delivered.replace(",", ""))
             except ValueError:
                 raise SetupError("%r is not a number." % args.delivered)
-            return run(True, value)
+            return run(True, value, interactive=True)
         rc = run()
         if BEESTAT_API_KEY and rc != 2:
             # After the alert lines, so the alert stays first in the email.
             try:
                 print(fetch_ecobee())
+                _beestat_failures(reset=True)
             except Exception as e:       # never let beestat affect the check
-                print("beestat: %s" % str(e).replace(BEESTAT_API_KEY, "***"))
+                text = str(e).replace(BEESTAT_API_KEY, "***")
+                print("beestat: %s" % text)
+                if _beestat_failures() == 3:     # tell once, not every check
+                    msg = ("ecobee records have failed 3 checks in a row (%s). "
+                           "Check the beestat API key and beestat.io." % text)
+                    if not push("ecobee logging is failing", msg, priority="default"):
+                        send_mail("ecobee logging is failing", msg)
         return rc
     except SetupError as e:
         print("Problem: %s" % e)
