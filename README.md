@@ -290,6 +290,52 @@ python3 pellet_watch.py --ecobee-history 2025-11-01 2026-04-30
 
 This writes `pellet_watch_ecobee_history_YYYY-MM.csv`, one file per month for all thermostats, in the same format as the regular ecobee files. Re-running rewrites them; they are never deleted automatically.
 
+### Boiler error alert
+
+With the minute logger running (`LOG_SECONDS`, `--serve`), the script emails
+and pushes once when the boiler has shown its error state for
+`ERROR_ALERT_MINUTES` (default 3), and pushes again when it is running again.
+The scheduled check repeats the test as a backup. The error code itself is in
+myPelletronic under General > Info. Set `"ERROR_ALERT": false` to turn it off.
+
+### ecobee heat dump (optional, trial)
+
+On hydro-air systems the boiler pump stops about a minute after the last call
+ends while the burner is still burning off, so the trapped water can overshoot
+to 190 degF or more. With `ECOBEE_DUMP` on, when the boiler water passes
+`ECOBEE_DUMP_START_C` (181 degF) with the burner not firing and no ecobee
+calling, the script raises one ecobee's heat setpoint by `ECOBEE_DUMP_BUMP_F`
+for up to `ECOBEE_DUMP_MINUTES`. That zone opens, the pump and the air-handler
+fan run, and the heat goes into the house. The hold is released when the water
+is down to `ECOBEE_DUMP_STOP_C` (170 degF). The hold has its own end time, so
+the thermostat goes back to its schedule even if the NAS stops. At most
+`ECOBEE_DUMP_MAX_PER_DAY` dumps a day; none while the boiler shows an error or
+the thermostat is not in heat or auto mode. Each start, end and skip is logged
+to `pellet_watch_dump_YYYY-MM.csv` (with the peak temperature).
+
+ecobee no longer issues developer keys, so this uses the same sign-in as Home
+Assistant's ecobee integration. Once, on your own computer:
+
+```
+pip install python-ecobee-api
+python tools/ecobee_login.py
+```
+
+It asks for your ecobee email, password and (if set) the two-step code, and
+writes `pellet_watch_ecobee_token.json`, a sign-in token only; the password is
+not saved. Copy it beside `pellet_watch.py` on the NAS (not into the web
+folder) and delete your local copy. Then set `"ECOBEE_DUMP": true` and
+`"ECOBEE_DUMP_THERMOSTAT"` to the thermostat's name. Check with:
+
+```
+python3 pellet_watch.py --ecobee-status     # read-only
+python3 pellet_watch.py --ecobee-dump-test  # a real 3-minute hold
+```
+
+`"ECOBEE_DUMP_DRY_RUN": true` logs what it would do without touching the
+thermostat. If ecobee rejects the token you get one push asking you to run
+`tools/ecobee_login.py` again. Changing your ecobee password revokes it.
+
 ## Choosing your thresholds
 
 You want the pellets to arrive before the hopper runs dry. Three numbers decide it:

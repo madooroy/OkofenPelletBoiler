@@ -13,3 +13,6 @@ pellet_watch_state.json.bak
 pellet_watch_log_*.csv
 pellet_watch_beestat.json
 pellet_watch_ecobee_*.csv
+pellet_watch_ecobee_token.json
+pellet_watch_ecobee_token.json.tmp
+pellet_watch_dump_*.csv
