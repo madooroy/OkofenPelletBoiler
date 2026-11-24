@@ -294,8 +294,11 @@ This writes `pellet_watch_ecobee_history_YYYY-MM.csv`, one file per month for al
 
 With the minute logger running (`LOG_SECONDS`, `--serve`), the script emails
 and pushes once when the boiler has shown its error state for
-`ERROR_ALERT_MINUTES` (default 3), and pushes again when it is running again.
-The scheduled check repeats the test as a backup. The error code itself is in
+`ERROR_ALERT_MINUTES` (default 3), and pushes again after it has been running
+again for 5 minutes. If neither email nor push can be sent, it tries again the
+next minute. The scheduled check repeats the test as a backup; without the
+minute logger it alerts the first time it sees the error (and exits 1 if it
+could not send, so DSM emails you). The error code itself is in
 myPelletronic under General > Info. Set `"ERROR_ALERT": false` to turn it off.
 
 ### ecobee heat dump (optional, trial)
@@ -307,8 +310,14 @@ to 190 degF or more. With `ECOBEE_DUMP` on, when the boiler water passes
 calling, the script raises one ecobee's heat setpoint by `ECOBEE_DUMP_BUMP_F`
 for up to `ECOBEE_DUMP_MINUTES`. That zone opens, the pump and the air-handler
 fan run, and the heat goes into the house. The hold is released when the water
-is down to `ECOBEE_DUMP_STOP_C` (170 degF). The hold has its own end time, so
-the thermostat goes back to its schedule even if the NAS stops. At most
+is down to `ECOBEE_DUMP_STOP_C` (170 degF), at the time limit, if the burner fires, or if
+the zone has not started calling after 3 minutes. The hold is set 3 degF above
+the room temperature (or the setpoint, if higher) so the zone really calls,
+and it has its own end time, so the thermostat goes back to its schedule even
+if the NAS stops. The script only resumes the schedule if its own hold is
+still the one in force, so a change someone makes at the thermostat during a
+dump is left alone. No dump starts while the water is already falling (a zone,
+usually the tank, is taking the heat). At most
 `ECOBEE_DUMP_MAX_PER_DAY` dumps a day; none while the boiler shows an error or
 the thermostat is not in heat or auto mode. Each start, end and skip is logged
 to `pellet_watch_dump_YYYY-MM.csv` (with the peak temperature).
@@ -317,7 +326,7 @@ ecobee no longer issues developer keys, so this uses the same sign-in as Home
 Assistant's ecobee integration. Once, on your own computer:
 
 ```
-pip install python-ecobee-api
+pip install python-ecobee-api      # needs Python 3.9 or newer on that computer
 python tools/ecobee_login.py
 ```
 
@@ -325,7 +334,7 @@ It asks for your ecobee email, password and (if set) the two-step code, and
 writes `pellet_watch_ecobee_token.json`, a sign-in token only; the password is
 not saved. Copy it beside `pellet_watch.py` on the NAS (not into the web
 folder) and delete your local copy. Then set `"ECOBEE_DUMP": true` and
-`"ECOBEE_DUMP_THERMOSTAT"` to the thermostat's name. Check with:
+`"ECOBEE_DUMP_THERMOSTAT"` to the thermostat's name (required). Check with:
 
 ```
 python3 pellet_watch.py --ecobee-status     # read-only
@@ -333,8 +342,9 @@ python3 pellet_watch.py --ecobee-dump-test  # a real 3-minute hold
 ```
 
 `"ECOBEE_DUMP_DRY_RUN": true` logs what it would do without touching the
-thermostat. If ecobee rejects the token you get one push asking you to run
-`tools/ecobee_login.py` again. Changing your ecobee password revokes it.
+thermostat. If the script cannot reach the thermostat (a rejected token,
+ecobee or the internet down) you get one push with the reason; for a rejected
+token it asks you to run `tools/ecobee_login.py` again. Changing your ecobee password revokes it.
 
 ## Choosing your thresholds
 

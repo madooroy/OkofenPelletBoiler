@@ -177,7 +177,7 @@ ERROR_ALERT_MINUTES = 3
 # --serve logger and pellet_watch_ecobee_token.json from tools/ecobee_login.py.
 ECOBEE_DUMP = False
 ECOBEE_DUMP_DRY_RUN = False      # True = only log what it would do
-ECOBEE_DUMP_THERMOSTAT = ""      # thermostat name; "" = the first one
+ECOBEE_DUMP_THERMOSTAT = ""      # thermostat name (required when ECOBEE_DUMP is on)
 ECOBEE_DUMP_START_C = 82.8       # 181 degF
 ECOBEE_DUMP_STOP_C = 76.7        # 170 degF
 ECOBEE_DUMP_MINUTES = 12         # the hold ends itself after this
@@ -320,6 +320,9 @@ def load_config():
         raise SetupError("ECOBEE_DUMP_STOP_C must be below ECOBEE_DUMP_START_C")
     if g["ECOBEE_DUMP_STOP_C"] < 70:     # stay well above the ~64 degC restart
         raise SetupError("ECOBEE_DUMP_STOP_C must be at least 70 (degC)")
+    if g["ECOBEE_DUMP"] and not g["ECOBEE_DUMP_THERMOSTAT"]:
+        raise SetupError("ECOBEE_DUMP needs ECOBEE_DUMP_THERMOSTAT (the thermostat's "
+                         "name; --ecobee-status lists them)")
     if not 0 < g["ECOBEE_DUMP_MINUTES"] <= 30 or not 0 < g["ECOBEE_DUMP_BUMP_F"] <= 5:
         raise SetupError("ECOBEE_DUMP_MINUTES must be 1-30 and ECOBEE_DUMP_BUMP_F 1-5")
     if g["LOG_SECONDS"] and g["LOG_SECONDS"] < 30:
@@ -1203,7 +1206,8 @@ def run(delivered=False, new_baseline=None, interactive=False, attempts=3):
         push("Pellet count restarted", summary)
         send_mail("Pellet count restarted", summary)
     try:                                 # backup for the minute logger
-        boiler_error_step(extra)
+        if not boiler_error_step(extra, from_check=True):
+            rc = 1                       # alert not delivered: let DSM email
     except Exception as e:
         print("boiler error check: %s" % e)
     if hint:                             # after the alert: alert stays first
@@ -1690,39 +1694,57 @@ def _utc_epoch(utc_text):
 ECOBEE_AUTH_URL = "https://auth.ecobee.com/oauth/token"
 ECOBEE_API_URL = "https://api.ecobee.com/1/thermostat"
 ECOBEE_CLIENT_ID = "183eORFPlXyz9BbDZwqexHPBQoVjgadh"   # ecobee web client
+ECOBEE_TOKEN_LOCK = os.path.join(HERE, "pellet_watch_ecobee.lock")
 _ecobee_access = {"token": None, "expires": 0}
 ECOBEE_LOCK = threading.Lock()
+
+
+class _TokenLock:
+    """Only one process refreshes the ecobee token at a time: a refresh token
+    may be single-use, so two refreshes with the same one can revoke it."""
+    def __enter__(self):
+        self.f = open(ECOBEE_TOKEN_LOCK, "a")
+        if fcntl:
+            fcntl.flock(self.f, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *exc):
+        if fcntl:
+            fcntl.flock(self.f, fcntl.LOCK_UN)
+        self.f.close()
 
 
 def _ecobee_access_token(force=False):
     """Access token from the saved refresh token (rotated tokens are saved)."""
     if not force and _ecobee_access["token"] and time.time() < _ecobee_access["expires"]:
         return _ecobee_access["token"]
-    try:
-        with open(ECOBEE_TOKEN_PATH, encoding="utf-8") as f:
-            refresh = json.load(f)["refresh_token"]
-    except (OSError, ValueError, KeyError):
-        raise RuntimeError("no ecobee sign-in: run tools/ecobee_login.py and upload "
-                           "pellet_watch_ecobee_token.json")
-    data = urllib.parse.urlencode({"grant_type": "refresh_token", "refresh_token": refresh,
-                                   "client_id": ECOBEE_CLIENT_ID}).encode()
-    try:
-        reply = json.loads(urllib.request.urlopen(
-            urllib.request.Request(ECOBEE_AUTH_URL, data=data), timeout=30).read())
-    except urllib.error.HTTPError as e:
-        if e.code in (400, 401, 403):
-            raise RuntimeError("ecobee sign-in expired: run tools/ecobee_login.py again")
-        raise RuntimeError("ecobee sign-in failed (HTTP %d)" % e.code)
-    token = reply.get("access_token")
-    if not token:
-        raise RuntimeError("ecobee sign-in returned no access token")
-    if reply.get("refresh_token") and reply["refresh_token"] != refresh:
-        tmp = ECOBEE_TOKEN_PATH + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump({"refresh_token": reply["refresh_token"]}, f)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, ECOBEE_TOKEN_PATH)
+    with _TokenLock():                   # re-read inside: another process may
+        try:                             # have just rotated it
+            with open(ECOBEE_TOKEN_PATH, encoding="utf-8") as f:
+                refresh = json.load(f)["refresh_token"]
+        except (OSError, ValueError, KeyError):
+            raise RuntimeError("no ecobee sign-in: run tools/ecobee_login.py and upload "
+                               "pellet_watch_ecobee_token.json")
+        data = urllib.parse.urlencode({"grant_type": "refresh_token", "refresh_token": refresh,
+                                       "client_id": ECOBEE_CLIENT_ID}).encode()
+        try:
+            reply = json.loads(urllib.request.urlopen(
+                urllib.request.Request(ECOBEE_AUTH_URL, data=data), timeout=30).read())
+        except urllib.error.HTTPError as e:
+            if e.code in (400, 401, 403):
+                raise RuntimeError("ecobee sign-in expired: run tools/ecobee_login.py again")
+            raise RuntimeError("ecobee sign-in failed (HTTP %d)" % e.code)
+        token = reply.get("access_token")
+        if not token:
+            raise RuntimeError("ecobee sign-in returned no access token")
+        if reply.get("refresh_token") and reply["refresh_token"] != refresh:
+            tmp = "%s.%d.tmp" % (ECOBEE_TOKEN_PATH, os.getpid())
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump({"refresh_token": reply["refresh_token"]}, f)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, ECOBEE_TOKEN_PATH)
     _ecobee_access.update(token=token,
                           expires=time.time() + int(reply.get("expires_in", 3600)) - 120)
     return token
@@ -1742,136 +1764,182 @@ def ecobee_request(body=None, query=None):
         try:
             reply = json.loads(urllib.request.urlopen(req, timeout=30).read())
         except urllib.error.HTTPError as e:
-            if e.code in (401, 403) and attempt == 0:
-                continue                 # token expired early: refresh once
             try:
-                msg = json.loads(e.read()).get("status", {}).get("message")
+                status = json.loads(e.read()).get("status", {})
             except Exception:
-                msg = None
-            raise RuntimeError("ecobee API error %d: %s" % (e.code, msg or e.reason))
+                status = {}
+            # ecobee reports an expired token as 500 + status 14 (or 16)
+            if attempt == 0 and (e.code in (401, 403) or status.get("code") in (14, 16)):
+                continue
+            raise RuntimeError("ecobee API error %d: %s" % (e.code, status.get("message") or e.reason))
         status = reply.get("status", {})
         if status.get("code", 0) != 0:
-            if status.get("code") in (14, 16) and attempt == 0:   # token problems
+            if status.get("code") in (14, 16) and attempt == 0:
                 continue
             raise RuntimeError("ecobee API: %s" % status.get("message"))
         return reply
     raise RuntimeError("ecobee API: not authorised")
 
 
-def ecobee_thermostats():
-    """[{identifier, name, heat, cool, mode, calling}] for all thermostats.
-    heat/cool are the current setpoints in tenths of degF."""
-    reply = ecobee_request(query={"selection": {
-        "selectionType": "registered", "selectionMatch": "",
-        "includeRuntime": True, "includeSettings": True,
-        "includeEquipmentStatus": True}})
+def ecobee_thermostats(identifier=None):
+    """[{identifier, name, time, heat, cool, actual, mode, calling, events}].
+    Temperatures in tenths of degF, as ecobee gives them."""
+    sel = ({"selectionType": "thermostats", "selectionMatch": identifier} if identifier
+           else {"selectionType": "registered", "selectionMatch": ""})
+    sel.update(includeRuntime=True, includeSettings=True, includeEquipmentStatus=True,
+               includeEvents=True)
+    reply = ecobee_request(query={"selection": sel})
     out = []
     for t in reply.get("thermostatList", []):
         status = t.get("equipmentStatus") or ""
+        rt = t.get("runtime", {})
         out.append({"identifier": t.get("identifier"), "name": t.get("name"),
                     "time": t.get("thermostatTime"),
-                    "heat": t.get("runtime", {}).get("desiredHeat"),
-                    "cool": t.get("runtime", {}).get("desiredCool"),
+                    "heat": rt.get("desiredHeat"), "cool": rt.get("desiredCool"),
+                    "actual": rt.get("actualTemperature"),
                     "mode": t.get("settings", {}).get("hvacMode"),
-                    "calling": "auxHeat" in status or "heatPump" in status})
+                    "calling": "auxHeat" in status or "heatPump" in status,
+                    "events": t.get("events") or []})
     return out
 
 
 def _dump_target(stats):
     for t in stats:
-        if not ECOBEE_DUMP_THERMOSTAT or (t["name"] or "").lower() == ECOBEE_DUMP_THERMOSTAT.lower():
+        if (t["name"] or "").lower() == ECOBEE_DUMP_THERMOSTAT.lower():
             return t
     raise RuntimeError("no ecobee thermostat named %r (found: %s)" % (
         ECOBEE_DUMP_THERMOSTAT, ", ".join(t["name"] or "?" for t in stats)))
 
 
 def ecobee_hold(t, minutes, bump_f):
-    """Hold t's heat setpoint bump_f above its current one for minutes; the
-    thermostat ends the hold itself, so a crash here can't leave it on."""
-    heat = int(t["heat"]) + int(round(bump_f * 10))
+    """Hold t's heat setpoint bump_f above the room (or the setpoint, if
+    higher) for minutes. The thermostat ends the hold itself, so a crash
+    here can't leave it on. Returns (heat, end) to recognise it later."""
+    if not t.get("time"):
+        raise RuntimeError("thermostat gave no local time; not setting a hold")
+    base = calendar.timegm(time.strptime(t["time"], "%Y-%m-%d %H:%M:%S"))
+    heat = max(int(t["heat"]), int(t.get("actual") or 0)) + int(round(bump_f * 10))
     cool = max(int(t["cool"] or 0), heat + 50)
-    try:                                 # the thermostat's own clock and zone
-        base = calendar.timegm(time.strptime(t["time"], "%Y-%m-%d %H:%M:%S"))
-    except (TypeError, ValueError):
-        base = calendar.timegm(time.localtime())
     start = time.gmtime(base - 60)
     end = time.gmtime(base + minutes * 60)
+    end_s = (time.strftime("%Y-%m-%d", end), time.strftime("%H:%M:%S", end))
+    try:
+        _set_hold(t, heat, cool, start, end_s)
+    except Exception as e:
+        e.hold = (heat, end_s)           # it may have been applied anyway
+        raise
+    return heat, end_s
+
+
+def _set_hold(t, heat, cool, start, end_s):
     ecobee_request(body={
         "selection": {"selectionType": "thermostats", "selectionMatch": t["identifier"]},
         "functions": [{"type": "setHold", "params": {
             "holdType": "dateTime", "heatHoldTemp": heat, "coolHoldTemp": cool,
             "startDate": time.strftime("%Y-%m-%d", start),
             "startTime": time.strftime("%H:%M:%S", start),
-            "endDate": time.strftime("%Y-%m-%d", end),
-            "endTime": time.strftime("%H:%M:%S", end)}}]})
-    return heat
+            "endDate": end_s[0], "endTime": end_s[1]}}]})
 
 
-def ecobee_resume(t):
+def _our_hold_on_top(t, heat, end_s):
+    """True if the running hold on top is the dump's own one."""
+    for ev in t["events"]:
+        if ev.get("running"):
+            return (ev.get("type") == "hold" and ev.get("heatHoldTemp") == heat
+                    and (ev.get("endDate"), ev.get("endTime")) == tuple(end_s))
+    return False
+
+
+def ecobee_release(identifier, heat, end_s):
+    """Resume the schedule only if the dump's hold is still the one on top,
+    so a change someone made at the thermostat is never undone.
+    Returns a short note for the log."""
+    t = ecobee_thermostats(identifier)[0]
+    if not _our_hold_on_top(t, heat, end_s):
+        return "hold already gone or replaced; left alone"
     ecobee_request(body={
-        "selection": {"selectionType": "thermostats", "selectionMatch": t["identifier"]},
+        "selection": {"selectionType": "thermostats", "selectionMatch": identifier},
         "functions": [{"type": "resumeProgram", "params": {"resumeAll": False}}]})
+    return "released"
 
 
 DUMP_FIELDS = ["time", "event", "boiler_c", "thermostat", "detail"]
-_dump = {"active": None, "cooldown": 0, "day": None, "count": 0, "fail_noted": False}
+_dump = {"active": None, "cooldown": 0, "day": None, "count": 0, "fail_noted": False,
+         "last": []}
 FIRING_STATES = (1, 2, 3, 4)             # start, ignition, softstart, powerburn
+DUMP_CHECK_CALL_S = 180                  # confirm the zone actually called
 
 
 def _dump_log(event, boiler, name="", detail=""):
-    path = os.path.join(DATA_PATH, time.strftime("pellet_watch_dump_%Y-%m.csv"))
-    new = not os.path.exists(path)
-    with open(path, "a", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        if new:
-            w.writerow(DUMP_FIELDS)
-        w.writerow([time.strftime("%Y-%m-%d %H:%M:%S"), event,
-                    "" if boiler is None else boiler, name, detail])
-    prune_logs("pellet_watch_dump_????-??.csv")
+    try:
+        path = os.path.join(DATA_PATH, time.strftime("pellet_watch_dump_%Y-%m.csv"))
+        new = not os.path.exists(path)
+        with open(path, "a", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            if new:
+                w.writerow(DUMP_FIELDS)
+            w.writerow([time.strftime("%Y-%m-%d %H:%M:%S"), event,
+                        "" if boiler is None else boiler, name, detail])
+        prune_logs("pellet_watch_dump_????-??.csv")
+    except OSError as e:
+        print("dump log: %s" % e)
+
+
+def _end_dump(boiler, why, release=True):
+    a, _dump["active"] = _dump["active"], None     # cleared first: never repeats
+    _dump["cooldown"] = a["now"] + 10 * 60
+    if release and not a.get("dry"):
+        try:
+            why += "; " + ecobee_release(a["id"], a["heat"], a["end"])
+        except Exception as e:
+            why += "; release failed: %s (the hold ends itself)" % e
+    _dump_log("end", boiler, a["name"], "%s after %.0f min, peak %s" % (
+        why, (a["now"] - a["start"]) / 60, a["peak"]))
 
 
 def heat_dump_step(extra, now=None):
     """Called once a minute by the logger with fresh boiler readings."""
-    if not ECOBEE_DUMP:
-        if _dump["active"] and not ECOBEE_DUMP_DRY_RUN:     # turned off mid-dump
-            try:
-                ecobee_resume(_dump["active"]["t"])
-            except Exception:
-                pass
-            _dump["active"] = None
-        return
     now = now or time.time()
     boiler, state = extra.get("boiler"), extra.get("state")
-    if boiler is None:
-        return
-    today = time.strftime("%Y-%m-%d", time.localtime(now))
-    if _dump["day"] != today:
-        _dump.update(day=today, count=0)
+    last = _dump["last"]
+    last.append(boiler)
+    del last[:-3]
     with ECOBEE_LOCK:
         a = _dump["active"]
         if a:
+            a["now"] = now
             elapsed = now - a["start"]
-            firing = state in FIRING_STATES
-            if boiler <= ECOBEE_DUMP_STOP_C or elapsed >= ECOBEE_DUMP_MINUTES * 60 or firing:
-                why = ("burner fired during the dump" if firing else
-                       "boiler down to %.1f" % boiler if boiler <= ECOBEE_DUMP_STOP_C
-                       else "time limit (hold ended itself)")
-                if elapsed < ECOBEE_DUMP_MINUTES * 60 and not ECOBEE_DUMP_DRY_RUN:
-                    try:
-                        ecobee_resume(a["t"])
-                    except Exception as e:
-                        why += "; resume failed: %s (the hold ends itself)" % e
-                _dump_log("end", boiler, a["t"]["name"],
-                          "%s after %.0f min, peak %.1f" % (why, elapsed / 60, a["peak"]))
-                _dump["active"] = None
-                _dump["cooldown"] = now + 10 * 60
-            else:
-                a["peak"] = max(a["peak"], boiler)
+            if not ECOBEE_DUMP:
+                return _end_dump(boiler, "dump turned off")
+            if boiler is None:
+                return _end_dump(boiler, "no boiler reading")
+            a["peak"] = max(a["peak"], boiler)
+            if state in FIRING_STATES:
+                return _end_dump(boiler, "burner fired during the dump")
+            if boiler <= ECOBEE_DUMP_STOP_C:
+                return _end_dump(boiler, "boiler down to %.1f" % boiler)
+            if elapsed >= ECOBEE_DUMP_MINUTES * 60:
+                return _end_dump(boiler, "time limit")
+            if not a["checked"] and not a.get("dry") and elapsed >= DUMP_CHECK_CALL_S:
+                a["checked"] = True
+                try:
+                    if not ecobee_thermostats(a["id"])[0]["calling"]:
+                        return _end_dump(boiler, "the zone did not call")
+                except Exception as e:
+                    _dump_log("note", boiler, a["name"], "call check failed: %s" % e)
             return
+        if not ECOBEE_DUMP or boiler is None:
+            return
+        today = time.strftime("%Y-%m-%d", time.localtime(now))
+        if _dump["day"] != today:
+            _dump.update(day=today, count=0)
         if (boiler < ECOBEE_DUMP_START_C or state in FIRING_STATES
                 or state == ERROR_STATE
                 or now < _dump["cooldown"] or _dump["count"] >= ECOBEE_DUMP_MAX_PER_DAY):
             return
+        prev = [b for b in last[:-1] if b is not None]
+        if prev and boiler < max(prev):  # already falling: a zone (likely the
+            return                       # tank) is taking the heat
         try:
             stats = ecobee_thermostats()
             t = _dump_target(stats)
@@ -1881,7 +1949,8 @@ def heat_dump_step(extra, now=None):
             _dump_log("error", boiler, "", str(e))
             if not _dump["fail_noted"]:
                 _dump["fail_noted"] = True
-                push("ecobee heat dump is not working", str(e), priority="default")
+                push("ecobee heat dump: cannot reach the thermostat", str(e),
+                     priority="default")
             return
         if t["mode"] not in ("heat", "auto", "auxHeatOnly"):
             _dump["cooldown"] = now + 60 * 60
@@ -1892,32 +1961,45 @@ def heat_dump_step(extra, now=None):
             _dump["cooldown"] = now + 5 * 60
             _dump_log("skip", boiler, t["name"], "already calling: %s" % ", ".join(busy))
             return
+        _dump["count"] += 1
         if ECOBEE_DUMP_DRY_RUN:
+            _dump["active"] = {"id": t["identifier"], "name": t["name"], "heat": None,
+                               "end": None, "start": now, "now": now, "peak": boiler,
+                               "checked": True, "dry": True}
             _dump_log("would start", boiler, t["name"], "dry run")
-            _dump["cooldown"] = now + 15 * 60
-            _dump["count"] += 1
             return
         try:
-            heat = ecobee_hold(t, ECOBEE_DUMP_MINUTES, ECOBEE_DUMP_BUMP_F)
+            heat, end_s = ecobee_hold(t, ECOBEE_DUMP_MINUTES, ECOBEE_DUMP_BUMP_F)
         except Exception as e:
             _dump["cooldown"] = now + 15 * 60
-            _dump_log("error", boiler, t["name"], "hold failed: %s" % e)
+            note = "hold failed: %s" % e
+            if getattr(e, "hold", None):  # e.g. a timeout after ecobee applied it
+                try:
+                    note += "; " + ecobee_release(t["identifier"], *e.hold)
+                except Exception as e2:
+                    note += "; release check failed: %s (the hold ends itself)" % e2
+            _dump_log("error", boiler, t["name"], note)
             return
-        _dump["active"] = {"t": t, "start": now, "peak": boiler}
-        _dump["count"] += 1
-        _dump_log("start", boiler, t["name"], "hold %.1f degF for up to %g min"
-                  % (heat / 10.0, ECOBEE_DUMP_MINUTES))
+        _dump["active"] = {"id": t["identifier"], "name": t["name"], "heat": heat,
+                           "end": end_s, "start": now, "now": now, "peak": boiler,
+                           "checked": False}
+        _dump_log("start", boiler, t["name"], "hold %.1f degF until %s (room %.1f)"
+                  % (heat / 10.0, end_s[1][:5], (t.get("actual") or 0) / 10.0))
 
 
 def ecobee_status():
     """--ecobee-status: show what the script sees (read-only)."""
     try:
-        for t in ecobee_thermostats():
-            print("%-14s heat set %.1f degF, mode %s, %s" % (
-                t["name"], (t["heat"] or 0) / 10.0, t["mode"],
+        stats = ecobee_thermostats()
+        for t in stats:
+            print("%-14s room %.1f degF, heat set %.1f degF, mode %s, %s" % (
+                t["name"], (t["actual"] or 0) / 10.0, (t["heat"] or 0) / 10.0, t["mode"],
                 "calling for heat" if t["calling"] else "idle"))
-        print("ecobee sign-in works. Dump target: %s" % (
-            ECOBEE_DUMP_THERMOSTAT or "the first thermostat above"))
+        print("ecobee sign-in works.")
+        if ECOBEE_DUMP_THERMOSTAT:
+            print("Dump thermostat: %s" % _dump_target(stats)["name"])
+        else:
+            print("Set ECOBEE_DUMP_THERMOSTAT to one of the names above.")
         return 0
     except Exception as e:
         print("ecobee: %s" % e)
@@ -1927,47 +2009,72 @@ def ecobee_status():
 def ecobee_dump_test(minutes=3):
     """--ecobee-dump-test: a real short hold on the dump thermostat."""
     try:
-        stats = ecobee_thermostats()
-        t = _dump_target(stats)
-        heat = ecobee_hold(t, minutes, ECOBEE_DUMP_BUMP_F)
+        t = _dump_target(ecobee_thermostats())
+        if t["mode"] not in ("heat", "auto", "auxHeatOnly"):
+            print("%s is in %s mode; not testing." % (t["name"], t["mode"]))
+            return 2
+        heat, end_s = ecobee_hold(t, minutes, ECOBEE_DUMP_BUMP_F)
     except Exception as e:
         print("ecobee: %s" % e)
         return 2
-    print("Hold set on %s: %.1f degF for %d minutes; it ends itself." % (
-        t["name"], heat / 10.0, minutes))
+    print("Hold set on %s: %.1f degF until %s; it ends itself. Its zone should "
+          "start calling within a minute or two." % (t["name"], heat / 10.0, end_s[1][:5]))
     return 0
 
 
 # --- boiler error alert ------------------------------------------------------
 
 ERROR_STATE = 11
+ERROR_CLEAR_MINUTES = 5                  # running this long before "running again"
 
 
-def boiler_error_step(extra, now=None):
-    """Alert once when the boiler sits in its error state; note recovery."""
+def _logger_running():
+    """True if the minute logger wrote a row in the last few minutes."""
+    try:
+        newest = max(glob.glob(os.path.join(DATA_PATH, "pellet_watch_log_????-??.csv")),
+                     key=os.path.getmtime)
+        return time.time() - os.path.getmtime(newest) < max(300, 3 * LOG_SECONDS)
+    except (ValueError, OSError):
+        return False
+
+
+def boiler_error_step(extra, now=None, from_check=False):
+    """Alert once when the boiler sits in its error state; note recovery.
+    Returns False if an error alert was due but could not be sent."""
     if not ERROR_ALERT or extra.get("state") is None:
-        return
+        return True
     now = now or time.time()
+    wait = ERROR_ALERT_MINUTES * 60
+    if from_check and not _logger_running():
+        wait = 0                         # no minute logger: alert at first sight
     news = []
 
     def change(st):
-        err = st.get("boiler_error") or {}
+        err = st.get("boiler_error")
         if extra.get("state") == ERROR_STATE:
             if not err:
-                st["boiler_error"] = {"since": now, "alerted": False}
-                return None
-            if not err.get("alerted") and now - err["since"] >= ERROR_ALERT_MINUTES * 60:
-                err["alerted"] = True
+                err = st["boiler_error"] = {"since": now, "alerted": False}
+            changed = err.pop("ok_since", None) is not None
+            if not err["alerted"] and now - err["since"] >= wait:
+                err["alerted"] = True    # claimed under the lock: sent once
                 news.append(("error", err["since"]))
                 return None
+            return None if changed or err["since"] == now else False
+        if not err:
             return False
-        if err:
-            st.pop("boiler_error", None)
-            if err.get("alerted"):
-                news.append(("ok", err["since"]))
+        if not err["alerted"]:           # a blip that never alerted
+            st.pop("boiler_error")
+            return None
+        if "ok_since" not in err:
+            err["ok_since"] = now
+            return None
+        if now - err["ok_since"] >= ERROR_CLEAR_MINUTES * 60:
+            st.pop("boiler_error")
+            news.append(("ok", err["since"]))
             return None
         return False
     _update_state(change)
+    delivered = True
     for kind, since in news:
         when = time.strftime("%H:%M", time.localtime(since))
         if kind == "error":
@@ -1983,7 +2090,16 @@ def boiler_error_step(extra, now=None):
         pushed = push(title, msg, PAGE_URL, priority="high" if kind == "error" else "default")
         print("%s. %s" % (title, msg))
         if kind == "error" and not sent and not pushed:
-            print("(No email or push could be sent.)")
+            delivered = False            # un-claim it so the next minute retries
+
+            def unclaim(st):
+                if st.get("boiler_error"):
+                    st["boiler_error"]["alerted"] = False
+                    return None
+                return False
+            _update_state(unclaim)
+            print("(No email or push could be sent; will try again.)")
+    return delivered
 
 
 LOG_FIELDS = ["time", "outdoor_c", "boiler_c", "boiler_set_c", "chamber_c",

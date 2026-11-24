@@ -3,7 +3,7 @@
 
 Run this on your own computer (not the NAS):
 
-    pip install python-ecobee-api
+    pip install python-ecobee-api      (needs Python 3.9 or newer)
     python ecobee_login.py
 
 It asks for your ecobee.com email and password (typed, never shown, never
@@ -54,7 +54,8 @@ def main():
     if not eco.refresh_token:
         sys.exit("Signed in, but ecobee returned no refresh token.")
     tmp = OUT + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
         json.dump({"refresh_token": eco.refresh_token}, f)
     os.replace(tmp, OUT)
     print("Saved %s" % OUT)

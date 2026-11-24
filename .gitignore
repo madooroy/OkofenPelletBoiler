@@ -16,3 +16,5 @@ pellet_watch_ecobee_*.csv
 pellet_watch_ecobee_token.json
 pellet_watch_ecobee_token.json.tmp
 pellet_watch_dump_*.csv
+pellet_watch_ecobee.lock
+pellet_watch_ecobee_token.json.*.tmp
