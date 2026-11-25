@@ -353,8 +353,10 @@ python3 pellet_watch.py --ecobee-status     # read-only
 python3 pellet_watch.py --ecobee-dump-test  # a real 3-minute hold
 ```
 
-`"ECOBEE_DUMP_DRY_RUN": true` logs what it would do without touching the
-thermostat. If the script cannot reach the thermostat (a rejected token,
+After each dump you get a quiet, low-priority push saying how long it ran,
+the boiler temperature at the start, peak and end, and why it ended; turn it
+off with `"ECOBEE_DUMP_NOTIFY": false`. `"ECOBEE_DUMP_DRY_RUN": true` logs what
+it would do without touching the thermostat. If the script cannot reach the thermostat (a rejected token,
 ecobee or the internet down) you get one push with the reason; for a rejected
 token it asks you to run `tools/ecobee_login.py` again. Changing your ecobee password revokes it.
 

@@ -186,6 +186,7 @@ ECOBEE_DUMP_STOP_C = 76.7        # 170 degF
 ECOBEE_DUMP_MINUTES = 12         # the hold ends itself after this
 ECOBEE_DUMP_BUMP_F = 3
 ECOBEE_DUMP_MAX_PER_DAY = 10
+ECOBEE_DUMP_NOTIFY = True        # a quiet (low-priority) push after each dump
 
 DATA_DIR = ""                    # where the CSV logs go: "" = next to the script,
                                  # or a folder name/path, e.g. "data"
@@ -231,7 +232,7 @@ SETTING_TYPES = {
     "ECOBEE_DUMP": bool, "ECOBEE_DUMP_DRY_RUN": bool, "ECOBEE_DUMP_THERMOSTAT": str,
     "ECOBEE_DUMP_START_C": (int, float), "ECOBEE_DUMP_STOP_C": (int, float),
     "ECOBEE_DUMP_MINUTES": (int, float), "ECOBEE_DUMP_BUMP_F": (int, float),
-    "ECOBEE_DUMP_MAX_PER_DAY": int,
+    "ECOBEE_DUMP_MAX_PER_DAY": int, "ECOBEE_DUMP_NOTIFY": bool,
     "BEESTAT_API_KEY": str,
     "BEESTAT_URL": str,
 }
@@ -2021,6 +2022,24 @@ def _end_dump(boiler, why, release=True):
             why += "; release failed: %s (the hold ends itself)" % e
     _dump_log("end", boiler, a["name"], "%s after %.0f min, peak %s" % (
         why, (a["now"] - a["start"]) / 60, a["peak"]))
+    if ECOBEE_DUMP_NOTIFY and not a.get("dry"):
+        _notify_dump(a, boiler, why)
+
+
+def _notify_dump(a, boiler, why):
+    """One quiet push per dump, when it ends."""
+    hm = lambda t: time.strftime("%H:%M", time.localtime(t))
+    mins = max(1, round((a["now"] - a["start"]) / 60))
+    early = why.startswith(("water not cooling", "no boiler reading", "burner fired"))
+    title = ("ecobee dump ended early: %s" % a["name"] if early
+             else "ecobee dump: %s, %d min" % (a["name"], mins))
+    msg = ("%s-%s: boiler water %s, peak %s, now %s. Ended: %s."
+           % (hm(a["start"]), hm(a["now"]), fmt_temp(a.get("b0", a["peak"])),
+              fmt_temp(a["peak"]), "?" if boiler is None else fmt_temp(boiler), why))
+    try:
+        push(title, msg, PAGE_URL, priority="low")
+    except Exception as e:               # never let this break the logger
+        print("dump push: %s" % e)
 
 
 def heat_dump_step(extra, now=None):
@@ -2043,7 +2062,7 @@ def heat_dump_step(extra, now=None):
             if state in FIRING_STATES:
                 return _end_dump(boiler, "burner fired during the dump")
             if boiler <= ECOBEE_DUMP_STOP_C:
-                return _end_dump(boiler, "boiler down to %.1f" % boiler)
+                return _end_dump(boiler, "boiler down to %s" % fmt_temp(boiler))
             if elapsed >= ECOBEE_DUMP_MINUTES * 60:
                 return _end_dump(boiler, "time limit")
             # ecobee's reported status lags by minutes, so judge by the water:
@@ -2106,7 +2125,7 @@ def heat_dump_step(extra, now=None):
             return
         _dump["active"] = {"id": t["identifier"], "name": t["name"], "heat": heat,
                            "end": end_s, "start": now, "now": now, "peak": boiler,
-                           "checked": False}
+                           "b0": boiler, "checked": False}
         _dump_log("start", boiler, t["name"], "hold %.1f degF until %s (room %.1f)"
                   % (heat / 10.0, end_s[1][:5], (t.get("actual") or 0) / 10.0))
 
