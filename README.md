@@ -80,8 +80,8 @@ Optional keys (defaults in brackets):
 | `ADVISORY_COLD_OUTDOOR` / `ADVISORY_COLD_BOILER` | Curve point for cold weather, °C: boiler setpoint at this outdoor temperature [-10 / 74] |
 | `ADVISORY_MILD_OUTDOOR` / `ADVISORY_MILD_BOILER` | Curve point for mild weather, °C [10 / 65] |
 | `DEGREE_DAY_BASE` | Base for heating degree-days, °C [18.3, i.e. 65 °F] |
-| `SETPOINT_HINT` | Push (or email, without ntfy) a suggestion to change the boiler's setpoint by hand when the advisory setpoint, from the last few days' average outdoor temperature, stays at least `SETPOINT_HINT_DIFF` away from it. Suggestions are rounded to 5 °F (or 1 °C); at most one per `SETPOINT_HINT_DAYS`, and not repeated until the suggestion changes. Needs at least 3 checks a day (the 6-hourly check gives 4) [false] |
-| `SETPOINT_HINT_DIFF` / `SETPOINT_HINT_DAYS` | Difference that triggers a hint, K / days of outdoor temperature averaged [2.8 (5 °F) / 3] |
+| `SETPOINT_HINT` | Push (high priority) and email a suggestion to change the boiler's setpoint by hand when the advisory setpoint, from the colder of the boiler's online forecast for the coming day and the last day's average outdoor temperature, is at least `SETPOINT_HINT_DIFF` away from it. So it suggests raising the setpoint before a cold snap, and lowering it only once it has been mild and is forecast to stay mild. Suggestions are rounded to 5 °F (or 1 °C); at most one per `SETPOINT_HINT_DAYS`, and not repeated until the suggestion changes. Needs at least 3 checks a day (the 6-hourly check gives 4) [false] |
+| `SETPOINT_HINT_DIFF` / `SETPOINT_HINT_DAYS` | Difference that triggers a hint, K / days of past outdoor temperature averaged [2.8 (5 °F) / 1] |
 | `SETPOINT_HINT_MIN` | Lowest setpoint a hint may suggest, °C, e.g. 68.3 (155 °F) so an indirect hot-water tank still reheats well [none] |
 | `LOG_SECONDS` | `--serve` logs boiler readings this often to `pellet_watch_log_YYYY-MM.csv` [0 = off; 60 = every minute] |
 | `LOG_KEEP_MONTHS` | Months of log files to keep [3] |

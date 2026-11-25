@@ -149,13 +149,16 @@ ADVISORY_MILD_BOILER = 65
 DEGREE_DAY_BASE = 18.3           # degC (65 degF), for heating degree-days
 
 # Optional setpoint hint: a push (or email if no ntfy) when the advisory
-# setpoint, from the average outdoor temperature over the last few days, stays
-# at least SETPOINT_HINT_DIFF away from the boiler's current setpoint. You then
-# change it yourself; nothing is written to the boiler. At most one hint per
-# SETPOINT_HINT_DAYS days, and none again until the suggestion changes.
+# setpoint is at least SETPOINT_HINT_DIFF away from the boiler's current one.
+# It looks ahead: the colder of the boiler's online forecast for the coming day
+# and the average of the last SETPOINT_HINT_DAYS days, so it suggests raising
+# the setpoint before a cold snap and lowering it only once it has been mild
+# and is forecast to stay mild. You change it yourself; nothing is written to
+# the boiler. At most one hint per SETPOINT_HINT_DAYS days, and none again
+# until the suggestion changes.
 SETPOINT_HINT = False
 SETPOINT_HINT_DIFF = 2.8         # K (2.8 K = 5 degF)
-SETPOINT_HINT_DAYS = 3           # days of outdoor temperature to average
+SETPOINT_HINT_DAYS = 1           # days of past outdoor temperature to average
 SETPOINT_HINT_MIN = None         # degC floor for hints, e.g. 68.3 (155 degF)
                                  # so the hot-water tank still reheats well
 
@@ -359,6 +362,7 @@ def read_boiler_once():
     weather = data.get("weather") or {}
     extra = {
         "outdoor": _outdoor(weather.get("L_temp")),
+        "forecast": _outdoor(weather.get("L_forecast_temp")),   # coming day's average
         "boiler": _temp(pe1.get("L_temp_act"), -10, 120),
         "boiler_set": _temp(pe1.get("L_temp_set"), 0, 120),
         "chamber": _temp(pe1.get("L_frt_temp_act"), -10, 1200),
@@ -784,7 +788,9 @@ def setpoint_hint(state, extra, now=None):
     if len(pts) < max(3, int(days * 4 * 0.75)):   # ~4 checks a day
         return None
     avg = sum(pts) / len(pts)
-    target = suggested_setpoint(avg)
+    forecast = extra.get("forecast") if extra else None
+    basis = avg if forecast is None else min(avg, forecast)
+    target = suggested_setpoint(basis)
     # Compare in the unit shown, after rounding, so 165 vs 160 degF counts as
     # exactly 5 degF however the boiler rounds its degC value.
     if TEMP_UNIT == "F":                 # 5 degF steps; floor rounded up
@@ -808,13 +814,18 @@ def setpoint_hint(state, extra, now=None):
         return None
     state["setpoint_hint"] = {"target": target, "time": now}   # undone if unsent
     word = "Milder" if target < current else "Colder"
+    span = "day" if days == 1 else "%g days" % days
+    if forecast is None:
+        why = "outdoor has averaged %s over the last %s" % (fmt_temp(avg), span)
+    else:
+        why = ("the forecast for the coming day averages %s; the last %s "
+               "averaged %s" % (fmt_temp(forecast), span, fmt_temp(avg)))
     title = "Boiler setpoint: consider %s" % fmt_temp(target)
-    msg = ("%s weather: outdoor has averaged %s over the last %g days. The "
-           "advisory curve suggests about %s (%.1f °C); the boiler is set to %s "
-           "(%.1f °C). To change it: myPelletronic > Pellematic 1 > Setting > "
-           "Control Temperature > %.1f. Advisory only; nothing was changed."
-           % (word, fmt_temp(avg), days, fmt_temp(target), target,
-              fmt_temp(current), current, target))
+    msg = ("%s weather: %s. The advisory curve suggests about %s (%.1f °C); the "
+           "boiler is set to %s (%.1f °C). To change it: myPelletronic > "
+           "Pellematic 1 > Setting > Control Temperature > %.1f. Advisory only; "
+           "nothing was changed."
+           % (word, why, fmt_temp(target), target, fmt_temp(current), current, target))
     return title, msg
 
 
@@ -917,6 +928,9 @@ def weather_rows(extra, cycles, outages=None):
     if out is not None:
         rows.append("<tr><td>Outdoor <span class='was'>(online weather)</span></td>"
                     "<td>%s</td></tr>" % fmt_temp(out))
+    if extra.get("forecast") is not None:
+        rows.append("<tr><td>Forecast <span class='was'>(coming day, average)</span></td>"
+                    "<td>%s</td></tr>" % fmt_temp(extra["forecast"]))
     if extra.get("boiler") is not None:
         rows.append("<tr><td>Boiler water now</td><td>%s</td></tr>"
                     % fmt_temp(extra["boiler"]))
@@ -1298,9 +1312,9 @@ def run(delivered=False, new_baseline=None, interactive=False, attempts=3):
     if hint:                             # after the alert: alert stays first
         title, msg = hint
         print(title + ". " + msg)
-        sent = push(title, msg, PAGE_URL, priority="default")
-        if not sent:                     # no ntfy (or it failed): email it
-            sent = send_mail(title, msg)
+        pushed = push(title, msg, PAGE_URL, priority="high")
+        mailed = send_mail(title, msg)   # both, so it isn't missed
+        sent = pushed or mailed
         if not sent:                     # undo the record so it is tried again
             _update_state(lambda st: st.pop("setpoint_hint", None))
     return rc
@@ -1360,9 +1374,10 @@ def status():
              state["baseline"], season, order, stop, now_hours,
              ", ".join(state.get("notified", [])) or "none"))
     sug = suggested_setpoint(extra.get("outdoor"))
-    print("Outdoor (online weather): %s. Boiler water %s, setpoint %s, state %s "
+    print("Outdoor (online weather): %s, forecast for the coming day %s. Boiler water %s, setpoint %s, state %s "
           "(%s), modulation %s. Suggested setpoint (advisory): %s."
-          % (fmt_temp(extra.get("outdoor"), 1), fmt_temp(extra.get("boiler"), 1),
+          % (fmt_temp(extra.get("outdoor"), 1), fmt_temp(extra.get("forecast"), 1),
+             fmt_temp(extra.get("boiler"), 1),
              fmt_temp(_setpoint(extra), 1) if _setpoint(extra) is not None
              else "none (not heating)", extra.get("statetext") or "?",
              extra.get("state") if extra.get("state") is not None else "?",
