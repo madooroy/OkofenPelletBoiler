@@ -402,6 +402,15 @@ def _outdoor(value):
     return v if v is not None and -50 <= v <= 50 else None
 
 
+def advised_setpoint(outdoor):
+    """(degC, note) for display: the advisory curve, but never below
+    SETPOINT_HINT_MIN, so the page and --status agree with the hints."""
+    sug = suggested_setpoint(outdoor)
+    if sug is None or SETPOINT_HINT_MIN is None or sug >= SETPOINT_HINT_MIN:
+        return sug, ""
+    return SETPOINT_HINT_MIN, " (your minimum)"
+
+
 def _forecast(value, outdoor):
     """The coming day's forecast average in degC. On some boilers it comes in
     degC even when the current temperature comes in degF (Marc's: 3.7 for a
@@ -954,10 +963,10 @@ def weather_rows(extra, cycles, outages=None):
     if _setpoint(extra) is not None:
         rows.append("<tr><td>Boiler setpoint now</td><td>%s</td></tr>"
                     % fmt_temp(_setpoint(extra)))
-    sug = suggested_setpoint(out)
+    sug, note = advised_setpoint(out)
     if sug is not None:
         rows.append("<tr><td>Suggested setpoint <span class='was'>(advisory)</span>"
-                    "</td><td>%s</td></tr>" % fmt_temp(sug))
+                    "</td><td>%s%s</td></tr>" % (fmt_temp(sug), note))
     cur = prev = None
     if cycles:
         cur = cycling_window(cycles, cycles[-1][0], outages=outages)
@@ -1390,16 +1399,16 @@ def status():
           % ({"ok": "OK", "order": "ORDER", "stop": "OVERDUE"}[level], used,
              state["baseline"], season, order, stop, now_hours,
              ", ".join(state.get("notified", [])) or "none"))
-    sug = suggested_setpoint(extra.get("outdoor"))
+    sug, note = advised_setpoint(extra.get("outdoor"))
     print("Outdoor (online weather): %s, forecast for the coming day %s. Boiler water %s, setpoint %s, state %s "
-          "(%s), modulation %s. Suggested setpoint (advisory): %s."
+          "(%s), modulation %s. Suggested setpoint (advisory): %s%s."
           % (fmt_temp(extra.get("outdoor"), 1), fmt_temp(extra.get("forecast"), 1),
              fmt_temp(extra.get("boiler"), 1),
              fmt_temp(_setpoint(extra), 1) if _setpoint(extra) is not None
              else "none (not heating)", extra.get("statetext") or "?",
              extra.get("state") if extra.get("state") is not None else "?",
              "?" if extra.get("modulation") is None else "%.0f%%" % extra["modulation"],
-             fmt_temp(sug, 1)))
+             fmt_temp(sug, 1), note))
     return 0
 
 
