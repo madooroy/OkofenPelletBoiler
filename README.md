@@ -301,6 +301,17 @@ minute logger it alerts the first time it sees the error (and exits 1 if it
 could not send, so DSM emails you). The error code itself is in
 myPelletronic under General > Info. Set `"ERROR_ALERT": false` to turn it off.
 
+### Boiler outages are left out of the figures
+
+With the minute logger running, the page leaves boiler outages out of the burn
+rate, starts per day, average burn and burner hours per degree-day, so a day
+of repairs doesn't skew them or push the "order by" date out. An outage runs
+from the first error reading, or the last reading before 30+ minutes with
+none (boiler switched off or unreachable), until the burner has run steadily
+for 10 minutes again; stops under 30 minutes are ignored. It is worked out
+from the minute logs each time the page is built, so earlier outages count
+too, and the page says how many hours were left out.
+
 ### ecobee heat dump (optional, trial)
 
 On hydro-air systems the boiler pump stops about a minute after the last call
@@ -311,7 +322,8 @@ calling, the script raises one ecobee's heat setpoint by `ECOBEE_DUMP_BUMP_F`
 for up to `ECOBEE_DUMP_MINUTES`. That zone opens, the pump and the air-handler
 fan run, and the heat goes into the house. The hold is released when the water
 is down to `ECOBEE_DUMP_STOP_C` (170 degF), at the time limit, if the burner fires, or if
-the zone has not started calling after 3 minutes. The hold is set 3 degF above
+the water has not started cooling after 8 minutes (the zone never opened;
+ecobee's reported status lags by minutes, so the water is the better test). The hold is set 3 degF above
 the room temperature (or the setpoint, if higher) so the zone really calls,
 and it has its own end time, so the thermostat goes back to its schedule even
 if the NAS stops. The script only resumes the schedule if its own hold is

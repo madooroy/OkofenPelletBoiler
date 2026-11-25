@@ -680,15 +680,83 @@ def current_level(state, used, order, stop):
 
 # ----------------------------- page ----------------------------------------
 
-def hours_per_day(history):
-    """Average burn rate over the stored readings (up to ~14 days)."""
+OUTAGE_GAP_S = 30 * 60              # no readings this long = boiler unreachable
+OUTAGE_BACK_S = 10 * 60             # this long burning again = outage over
+OUTAGE_MIN_S = 30 * 60              # shorter stops aren't worth leaving out
+
+
+def find_outages(since):
+    """Periods the boiler wasn't heating normally, from the minute logs:
+    from the first error reading (state 11), or the last reading before 30+
+    minutes without any, until it has burned steadily (Powerburn) for 10
+    minutes. Returns [[t0, t1, hours0, hours1, starts0, starts1], ...]; an
+    outage still going ends at the latest reading. [] without minute logs."""
+    rows = []
+    for path in sorted(glob.glob(os.path.join(DATA_PATH, "pellet_watch_log_????-??.csv")))[-3:]:
+        try:
+            with open(path, newline="", encoding="utf-8") as f:
+                for r in csv.DictReader(f):
+                    try:
+                        t = time.mktime(time.strptime(r["time"], "%Y-%m-%d %H:%M:%S"))
+                        if t < since:
+                            continue
+                        rows.append((t, _plain(r.get("state")),
+                                     float(r["burner_hours"]), float(r["starts"])))
+                    except (KeyError, TypeError, ValueError):
+                        continue
+        except OSError:
+            continue
+    rows.sort()
+    out, cur, burn, prev = [], None, None, None
+    for row in rows:
+        t, state = row[0], row[1]
+        if cur is None:
+            if prev and t - prev[0] >= OUTAGE_GAP_S:
+                cur = list(prev)
+            elif state == 11:
+                cur = list(row)
+            if cur is not None:
+                burn = None
+        if cur is not None:
+            if state == 4:
+                burn = burn or row
+                if t - burn[0] >= OUTAGE_BACK_S:
+                    out.append([cur[0], burn[0], cur[2], burn[2], cur[3], burn[3]])
+                    cur = burn = None
+            else:
+                burn = None
+        prev = row
+    if cur is not None and prev:
+        out.append([cur[0], prev[0], cur[2], prev[2], cur[3], prev[3]])
+    return [o for o in out if o[1] - o[0] >= OUTAGE_MIN_S]
+
+
+def outage_share(t0, t1, outages):
+    """(seconds, burner hours, starts) of the outages inside t0..t1; a partly
+    covered outage counts in proportion to the time inside."""
+    secs = hours = starts = 0.0
+    for o in outages or []:
+        a, b = max(t0, o[0]), min(t1, o[1])
+        if b <= a:
+            continue
+        frac = (b - a) / (o[1] - o[0]) if o[1] > o[0] else 1.0
+        secs += b - a
+        hours += (o[3] - o[2]) * frac
+        starts += (o[5] - o[4]) * frac
+    return secs, hours, starts
+
+
+def hours_per_day(history, outages=None):
+    """Average burn rate over the stored readings (up to ~14 days), leaving
+    out boiler outages."""
     if len(history) < 2:
         return None
     (t0, h0), (t1, h1) = history[0][:2], history[-1][:2]
-    days = (t1 - t0) / 86400.0
-    if days < 0.5 or h1 <= h0:
+    secs, oh, _ = outage_share(t0, t1, outages)
+    days = (t1 - t0 - secs) / 86400.0
+    if days < 0.5 or h1 - h0 - oh <= 0:
         return None
-    return (h1 - h0) / days
+    return (h1 - h0 - oh) / days
 
 
 def suggested_setpoint(outdoor):
@@ -760,9 +828,10 @@ def fmt_temp(c, digits=0):
     return "%.*f °C" % (digits, c)
 
 
-def degree_days(points):
-    """Heating degree-days (degC-days) across readings [t, ..., outdoor_c].
-    None if fewer than 2 readings have an outdoor temperature."""
+def degree_days(points, outages=None):
+    """Heating degree-days (degC-days) across readings [t, ..., outdoor_c],
+    leaving out boiler outages. None if fewer than 2 readings have an
+    outdoor temperature."""
     pts = [p for p in points if len(p) > 3 and p[3] is not None]
     if len(pts) < 2:
         return None
@@ -770,11 +839,12 @@ def degree_days(points):
     for a, b in zip(pts, pts[1:]):
         dt = (b[0] - a[0]) / 86400.0
         if 0 < dt <= 1.5:                # skip long gaps (e.g. NAS was off)
-            total += max(0.0, DEGREE_DAY_BASE - (a[3] + b[3]) / 2.0) * dt
+            out = outage_share(a[0], b[0], outages)[0] / 86400.0
+            total += max(0.0, DEGREE_DAY_BASE - (a[3] + b[3]) / 2.0) * (dt - out)
     return total
 
 
-def cycling_window(cycles, end_time, days=7):
+def cycling_window(cycles, end_time, days=7, outages=None):
     """Starts per day and average burn minutes for the `days` before end_time.
     None until at least a day of readings is available. Burner hours are
     whole numbers, so short windows are rough."""
@@ -785,33 +855,37 @@ def cycling_window(cycles, end_time, days=7):
     last = pts[-1]
     window = [c for c in pts if c[0] >= last[0] - days * 86400]
     first = window[0]
-    span = (last[0] - first[0]) / 86400.0
-    d_starts = last[2] - first[2]
-    d_hours = last[1] - first[1]
+    secs, oh, os_ = outage_share(first[0], last[0], outages)
+    span = (last[0] - first[0] - secs) / 86400.0
+    d_starts = last[2] - first[2] - os_
+    d_hours = last[1] - first[1] - oh
     if span < 1.0 or d_starts <= 0 or d_hours < 0:
         return None
-    hdd = degree_days(window)
-    return {"days": span, "starts_per_day": d_starts / span,
+    hdd = degree_days(window, outages)
+    return {"days": span, "calendar_days": (last[0] - first[0]) / 86400.0,
+            "excluded_h": secs / 3600.0,
+            "starts_per_day": d_starts / span,
             "avg_burn_min": d_hours * 60.0 / d_starts,
             "hdd": hdd,
             "hours_per_hdd": d_hours / hdd if hdd and hdd >= 1 else None}
 
 
-def cycling_rows(cycles, now_hours):
+def cycling_rows(cycles, now_hours, outages=None):
     """The burner cycling section, or "" if the boiler doesn't report starts."""
     if not cycles or cycles[-1][2] is None:
         return ""
     starts = cycles[-1][2]
     rows = []
-    cur = cycling_window(cycles, cycles[-1][0])
-    prev = cycling_window(cycles, cycles[-1][0] - 7 * 86400)
-    full_weeks = cur and prev and cur["days"] >= 6 and prev["days"] >= 6
+    cur = cycling_window(cycles, cycles[-1][0], outages=outages)
+    prev = cycling_window(cycles, cycles[-1][0] - 7 * 86400, outages=outages)
+    full_weeks = cur and prev and cur["days"] >= 5 and prev["days"] >= 5
 
     def was(key, fmt):
         return (" <span class='was'>(week before: %s)</span>" % (fmt % prev[key])
                 if full_weeks else "")
     if cur:
-        label = "last %d days" % round(cur["days"]) if cur["days"] >= 1.5 else "last day"
+        label = ("last %d days" % round(cur["calendar_days"])
+                 if cur["calendar_days"] >= 1.5 else "last day")
         rows.append("<tr><td>Starts per day <span class='was'>(%s)</span></td>"
                     "<td>%.0f%s</td></tr>" % (label, cur["starts_per_day"],
                                               was("starts_per_day", "%.0f")))
@@ -826,10 +900,17 @@ def cycling_rows(cycles, now_hours):
                     % (now_hours * 60.0 / starts))
     rows.append("<tr><td>Burner starts (lifetime)</td><td>%s</td></tr>"
                 % format(starts, ",.0f"))
+    if cur and cur.get("excluded_h", 0) >= 0.5:
+        n = sum(1 for o in outages or [] if o[1] > cycles[-1][0] - 7 * 86400)
+        rows.append("<tr><td colspan='2' class='was' style='text-align:left'>"
+                    "Recent figures leave out %d boiler outage%s (%.0f h) and "
+                    "the restarts during %s.</td></tr>"
+                    % (n, "" if n == 1 else "s", cur["excluded_h"],
+                       "it" if n == 1 else "them"))
     return "<h2>Burner cycling</h2>\n<table>\n%s\n</table>" % "\n".join(rows)
 
 
-def weather_rows(extra, cycles):
+def weather_rows(extra, cycles, outages=None):
     """Outdoor temperature, degree-days and the advisory setpoint."""
     if not extra:
         return ""
@@ -850,17 +931,18 @@ def weather_rows(extra, cycles):
                     "</td><td>%s</td></tr>" % fmt_temp(sug))
     cur = prev = None
     if cycles:
-        cur = cycling_window(cycles, cycles[-1][0])
-        prev = cycling_window(cycles, cycles[-1][0] - 7 * 86400)
+        cur = cycling_window(cycles, cycles[-1][0], outages=outages)
+        prev = cycling_window(cycles, cycles[-1][0] - 7 * 86400, outages=outages)
     if cur and cur.get("hdd") is not None and cur["days"] >= 1:
         unit = 1.8 if TEMP_UNIT == "F" else 1.0          # degF-days
-        label = "last %d days" % round(cur["days"]) if cur["days"] >= 1.5 else "last day"
+        label = ("last %d days" % round(cur["calendar_days"])
+                 if cur["calendar_days"] >= 1.5 else "last day")
         rows.append("<tr><td>Heating degree-days <span class='was'>(%s)</span></td>"
                     "<td>%.0f</td></tr>" % (label, cur["hdd"] * unit))
         if cur.get("hours_per_hdd"):
             before = ""
-            if (prev and prev.get("hours_per_hdd") and cur["days"] >= 6
-                    and prev["days"] >= 6):
+            if (prev and prev.get("hours_per_hdd") and cur["days"] >= 5
+                    and prev["days"] >= 5):
                 before = (" <span class='was'>(week before: %.2f)</span>"
                           % (prev["hours_per_hdd"] / unit))
             rows.append("<tr><td>Burner hours per degree-day</td><td>%.2f%s</td></tr>"
@@ -1019,7 +1101,12 @@ def render_page(now_hours, state, level, error=None, extra=None):
             order_button = ('<a class="orderbtn" href="%s" target="_blank" '
                             'rel="noopener">Order pellets</a>'
                             % html.escape(ORDER_URL, quote=True))
-        rate = hours_per_day(state.get("history", []))
+        try:
+            outages = find_outages(time.time() - 22 * 86400)
+        except Exception as e:           # never let this break the page
+            print("Outage scan: %s" % e)
+            outages = []
+        rate = hours_per_day(state.get("history", []), outages)
         eta = ""
         if rate:
             eta = "<tr><td>Burn rate</td><td>%.1f h/day</td></tr>" % rate
@@ -1053,8 +1140,8 @@ def render_page(now_hours, state, level, error=None, extra=None):
          delivered_on, format(baseline, ",.0f"),
          season, format(baseline + order, ",.0f"), order,
          format(baseline + stop, ",.0f"), stop, eta,
-         cycling_rows(state.get("cycles", []), now_hours)
-         + weather_rows(extra, state.get("cycles", []))))
+         cycling_rows(state.get("cycles", []), now_hours, outages)
+         + weather_rows(extra, state.get("cycles", []), outages)))
     checked = time.time()
     return """<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8">
@@ -1867,7 +1954,7 @@ DUMP_FIELDS = ["time", "event", "boiler_c", "thermostat", "detail"]
 _dump = {"active": None, "cooldown": 0, "day": None, "count": 0, "fail_noted": False,
          "last": []}
 FIRING_STATES = (1, 2, 3, 4)             # start, ignition, softstart, powerburn
-DUMP_CHECK_CALL_S = 180                  # confirm the zone actually called
+DUMP_CHECK_S = 8 * 60                    # by now the water must be cooling
 
 
 def _dump_log(event, boiler, name="", detail=""):
@@ -1920,13 +2007,11 @@ def heat_dump_step(extra, now=None):
                 return _end_dump(boiler, "boiler down to %.1f" % boiler)
             if elapsed >= ECOBEE_DUMP_MINUTES * 60:
                 return _end_dump(boiler, "time limit")
-            if not a["checked"] and not a.get("dry") and elapsed >= DUMP_CHECK_CALL_S:
-                a["checked"] = True
-                try:
-                    if not ecobee_thermostats(a["id"])[0]["calling"]:
-                        return _end_dump(boiler, "the zone did not call")
-                except Exception as e:
-                    _dump_log("note", boiler, a["name"], "call check failed: %s" % e)
+            # ecobee's reported status lags by minutes, so judge by the water:
+            # once the zone's valve is open it cools within a few minutes.
+            if (not a["checked"] and not a.get("dry") and elapsed >= DUMP_CHECK_S
+                    and boiler > a["peak"] - 1.0):
+                return _end_dump(boiler, "water not cooling: the zone did not open")
             return
         if not ECOBEE_DUMP or boiler is None:
             return
