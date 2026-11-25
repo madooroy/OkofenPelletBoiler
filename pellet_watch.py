@@ -362,7 +362,8 @@ def read_boiler_once():
     weather = data.get("weather") or {}
     extra = {
         "outdoor": _outdoor(weather.get("L_temp")),
-        "forecast": _outdoor(weather.get("L_forecast_temp")),   # coming day's average
+        "forecast": _forecast(weather.get("L_forecast_temp"),
+                              _outdoor(weather.get("L_temp"))),
         "boiler": _temp(pe1.get("L_temp_act"), -10, 120),
         "boiler_set": _temp(pe1.get("L_temp_set"), 0, 120),
         "chamber": _temp(pe1.get("L_frt_temp_act"), -10, 1200),
@@ -399,6 +400,22 @@ def _outdoor(value):
     if v is not None and WEATHER_UNIT == "F":
         v = round((v - 32) * 5 / 9, 1)
     return v if v is not None and -50 <= v <= 50 else None
+
+
+def _forecast(value, outdoor):
+    """The coming day's forecast average in degC. On some boilers it comes in
+    degC even when the current temperature comes in degF (Marc's: 3.7 for a
+    39 degF day), so take whichever reading of it is nearer the current
+    outdoor temperature."""
+    v = _temp(value, -60, 130)
+    if v is None:
+        return None
+    as_c, as_f = v, round((v - 32) * 5 / 9, 1)
+    if outdoor is None:
+        pick = as_c if WEATHER_UNIT == "C" else as_f
+    else:
+        pick = as_c if abs(as_c - outdoor) <= abs(as_f - outdoor) else as_f
+    return pick if -50 <= pick <= 50 else None
 
 
 def _setpoint(extra):
