@@ -513,23 +513,21 @@ def check_baseline(new, reading):
 
 # ----------------------------- alerts --------------------------------------
 
-def _ascii_header(text):
-    # HTTP headers must be latin-1; keep ntfy titles plain.
-    return text.replace("\u2013", "-").encode("latin-1", "replace").decode("latin-1")
-
-
 def push(title, message, click_url="", priority="high"):
     """Phone push via ntfy. Returns True if sent, False if failed, None if off."""
     if not NTFY_TOPIC:
         return None
-    headers = {"Title": _ascii_header(title), "Priority": priority, "Tags": "fire"}
+    # The title goes in the URL, UTF-8 encoded: as an HTTP header a "°" arrives
+    # garbled ("155 �F").
+    headers = {"Priority": priority, "Tags": "fire"}
     if click_url:
         headers["Click"] = click_url     # tapping the notification opens it
     if PAGE_URL:
         headers["Actions"] = "view, Status page, %s" % PAGE_URL
     try:
         req = urllib.request.Request(
-            NTFY_SERVER.rstrip("/") + "/" + urllib.parse.quote(NTFY_TOPIC, safe=""),
+            NTFY_SERVER.rstrip("/") + "/" + urllib.parse.quote(NTFY_TOPIC, safe="")
+            + "?" + urllib.parse.urlencode({"title": title}),
             data=message.encode("utf-8"), headers=headers)
         urllib.request.urlopen(req, timeout=20)
         return True
