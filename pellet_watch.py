@@ -2013,7 +2013,7 @@ DUMP_FIELDS = ["time", "event", "boiler_c", "thermostat", "detail"]
 DUMP_FAIL_BACKOFF_S = 60 * 60          # after a dump the zone ignored
 DUMP_FAILS_PER_DAY = 2                 # then stop for the day
 DUMP_ROOM_MARGIN_F = 1.5               # room this far above the setpoint:
-                                       # ecobee ignores the hold, so don't try
+DUMP_WARM_BUMP_F = 5                   # ecobee ignored +3 degF holds, so nudge harder
 _dump = {"active": None, "cooldown": 0, "day": None, "count": 0, "fail_noted": False,
          "fails": {}, "tcool": {},
          "last": []}
@@ -2133,23 +2133,25 @@ def heat_dump_step(extra, now=None):
             _dump["cooldown"] = now + 5 * 60
             _dump_log("skip", boiler, "", "already calling: %s" % ", ".join(busy))
             return
-        t, why_not = None, []
-        for c in cands:                  # first thermostat that can take the heat
+        usable, why_not = [], []
+        for i, c in enumerate(cands):
             if c["mode"] not in ("heat", "auto", "auxHeatOnly"):
                 why_not.append("%s: mode %s" % (c["name"], c["mode"]))
             elif _dump["fails"].get(c["name"], 0) >= DUMP_FAILS_PER_DAY:
                 why_not.append("%s: paused for today" % c["name"])
             elif now < _dump["tcool"].get(c["name"], 0):
                 why_not.append("%s: zone didn't open last time" % c["name"])
-            elif (c.get("actual") is not None and c.get("heat") is not None
-                  and c["actual"] >= c["heat"] + DUMP_ROOM_MARGIN_F * 10):
-                # ecobee ignores the hold when the room is already this warm
-                why_not.append("%s: room %.1f degF is %.1f above its setpoint %.1f" % (
-                    c["name"], c["actual"] / 10.0, (c["actual"] - c["heat"]) / 10.0,
-                    c["heat"] / 10.0))
-            else:
-                t = c
-                break
+            else:                        # how far the room is above its setpoint
+                over = (c["actual"] - c["heat"] if c.get("actual") is not None
+                        and c.get("heat") is not None else 0)
+                usable.append((over, i, c))
+        # the coolest zone (relative to its setpoint) takes the heat; the
+        # list order breaks ties
+        usable.sort(key=lambda x: (x[0], x[1]))
+        t = usable[0][2] if usable else None
+        bump = ECOBEE_DUMP_BUMP_F
+        if t is not None and usable[0][0] >= DUMP_ROOM_MARGIN_F * 10:
+            bump = max(bump, DUMP_WARM_BUMP_F)   # ecobee ignored +3 here before
         if t is None:
             _dump["cooldown"] = now + 15 * 60
             _dump_log("skip", boiler, "", "; ".join(why_not))
@@ -2162,7 +2164,7 @@ def heat_dump_step(extra, now=None):
             _dump_log("would start", boiler, t["name"], "dry run")
             return
         try:
-            heat, end_s = ecobee_hold(t, ECOBEE_DUMP_MINUTES, ECOBEE_DUMP_BUMP_F)
+            heat, end_s = ecobee_hold(t, ECOBEE_DUMP_MINUTES, bump)
         except Exception as e:
             _dump["cooldown"] = now + 15 * 60
             note = "hold failed: %s" % e
@@ -2176,8 +2178,9 @@ def heat_dump_step(extra, now=None):
         _dump["active"] = {"id": t["identifier"], "name": t["name"], "heat": heat,
                            "end": end_s, "start": now, "now": now, "peak": boiler,
                            "b0": boiler, "checked": False}
-        _dump_log("start", boiler, t["name"], "hold %.1f degF until %s (room %.1f)"
-                  % (heat / 10.0, end_s[1][:5], (t.get("actual") or 0) / 10.0))
+        _dump_log("start", boiler, t["name"], "hold %.1f degF until %s (room %.1f, "
+                  "setpoint %.1f)" % (heat / 10.0, end_s[1][:5], (t.get("actual") or 0) / 10.0,
+                                     (t.get("heat") or 0) / 10.0))
 
 
 def ecobee_status():

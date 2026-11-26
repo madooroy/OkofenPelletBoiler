@@ -328,9 +328,8 @@ the room temperature (or the setpoint, if higher) so the zone really calls,
 and it has its own end time, so the thermostat goes back to its schedule even
 if the NAS stops. The script only resumes the schedule if its own hold is
 still the one in force, so a change someone makes at the thermostat during a
-dump is left alone. It doesn't try when the room is already 1.5 degF or more above the
-thermostat's setpoint (ecobee then ignores the hold), and after a dump the
-zone didn't open it waits an hour; after two such failures it stops for the
+dump is left alone. After a dump the zone didn't open it waits an hour before using that
+thermostat again; after two such failures that thermostat is paused for the
 day. No dump starts while the water is already falling (a zone,
 usually the tank, is taking the heat). At most
 `ECOBEE_DUMP_MAX_PER_DAY` dumps a day; none while the boiler shows an error or
@@ -350,9 +349,11 @@ writes `pellet_watch_ecobee_token.json`, a sign-in token only; the password is
 not saved. Copy it beside `pellet_watch.py` on the NAS (not into the web
 folder) and delete your local copy. Then set `"ECOBEE_DUMP": true` and
 `"ECOBEE_DUMP_THERMOSTATS"` to the thermostats' names in order of preference,
-e.g. `["Main Floor", "Upstairs"]`: each dump goes to the first one that can
-take the heat (heat mode, room not already 1.5 degF above its setpoint, and
-not ignoring holds today). A single `"ECOBEE_DUMP_THERMOSTAT"` name still
+e.g. `["Main Floor", "Upstairs"]`: each dump goes to the coolest one relative to
+its setpoint (the list order breaks ties), skipping any not in heat mode or
+ignoring holds today. If even that room is 1.5 degF or more above its
+setpoint the hold is set 5 degF above the room instead of 3 (ecobee ignored
++3 holds then). A single `"ECOBEE_DUMP_THERMOSTAT"` name still
 works. Check with:
 
 ```
