@@ -321,14 +321,17 @@ to 190 degF or more. With `ECOBEE_DUMP` on, when the boiler water passes
 calling, the script raises one ecobee's heat setpoint by `ECOBEE_DUMP_BUMP_F`
 for up to `ECOBEE_DUMP_MINUTES`. That zone opens, the pump and the air-handler
 fan run, and the heat goes into the house. The hold is released when the water
-is down to `ECOBEE_DUMP_STOP_C` (170 degF), at the time limit, if the burner fires, or if
+is down to `ECOBEE_DUMP_STOP_C` (176 degF; the zone keeps running briefly after release), at the time limit, if the burner fires, or if
 the water has not started cooling after 8 minutes (the zone never opened;
 ecobee's reported status lags by minutes, so the water is the better test). The hold is set 3 degF above
 the room temperature (or the setpoint, if higher) so the zone really calls,
 and it has its own end time, so the thermostat goes back to its schedule even
 if the NAS stops. The script only resumes the schedule if its own hold is
 still the one in force, so a change someone makes at the thermostat during a
-dump is left alone. No dump starts while the water is already falling (a zone,
+dump is left alone. It doesn't try when the room is already 1.5 degF or more above the
+thermostat's setpoint (ecobee then ignores the hold), and after a dump the
+zone didn't open it waits an hour; after two such failures it stops for the
+day. No dump starts while the water is already falling (a zone,
 usually the tank, is taking the heat). At most
 `ECOBEE_DUMP_MAX_PER_DAY` dumps a day; none while the boiler shows an error or
 the thermostat is not in heat or auto mode. Each start, end and skip is logged

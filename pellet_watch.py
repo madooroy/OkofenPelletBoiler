@@ -182,7 +182,9 @@ ECOBEE_DUMP = False
 ECOBEE_DUMP_DRY_RUN = False      # True = only log what it would do
 ECOBEE_DUMP_THERMOSTAT = ""      # thermostat name (required when ECOBEE_DUMP is on)
 ECOBEE_DUMP_START_C = 82.8       # 181 degF
-ECOBEE_DUMP_STOP_C = 76.7        # 170 degF
+ECOBEE_DUMP_STOP_C = 80.0        # 176 degF: the zone keeps running a minute or
+                                 # two after release, so stop early enough
+                                 # that the water doesn't fall to the restart
 ECOBEE_DUMP_MINUTES = 12         # the hold ends itself after this
 ECOBEE_DUMP_BUMP_F = 3
 ECOBEE_DUMP_MAX_PER_DAY = 10
@@ -1991,7 +1993,12 @@ def ecobee_release(identifier, heat, end_s):
 
 
 DUMP_FIELDS = ["time", "event", "boiler_c", "thermostat", "detail"]
+DUMP_FAIL_BACKOFF_S = 60 * 60          # after a dump the zone ignored
+DUMP_FAILS_PER_DAY = 2                 # then stop for the day
+DUMP_ROOM_MARGIN_F = 1.5               # room this far above the setpoint:
+                                       # ecobee ignores the hold, so don't try
 _dump = {"active": None, "cooldown": 0, "day": None, "count": 0, "fail_noted": False,
+         "fails": 0,
          "last": []}
 FIRING_STATES = (1, 2, 3, 4)             # start, ignition, softstart, powerburn
 DUMP_CHECK_S = 8 * 60                    # by now the water must be cooling
@@ -2015,6 +2022,13 @@ def _dump_log(event, boiler, name="", detail=""):
 def _end_dump(boiler, why, release=True):
     a, _dump["active"] = _dump["active"], None     # cleared first: never repeats
     _dump["cooldown"] = a["now"] + 10 * 60
+    paused = False
+    if why.startswith("water not cooling"):
+        _dump["fails"] += 1
+        _dump["cooldown"] = a["now"] + DUMP_FAIL_BACKOFF_S
+        if _dump["fails"] >= DUMP_FAILS_PER_DAY:
+            _dump["count"] = ECOBEE_DUMP_MAX_PER_DAY      # no more today
+            paused = True
     if release and not a.get("dry"):
         try:
             why += "; " + ecobee_release(a["id"], a["heat"], a["end"])
@@ -2023,16 +2037,20 @@ def _end_dump(boiler, why, release=True):
     _dump_log("end", boiler, a["name"], "%s after %.0f min, peak %s" % (
         why, (a["now"] - a["start"]) / 60, a["peak"]))
     if ECOBEE_DUMP_NOTIFY and not a.get("dry"):
-        _notify_dump(a, boiler, why)
+        _notify_dump(a, boiler, why, paused)
 
 
-def _notify_dump(a, boiler, why):
+def _notify_dump(a, boiler, why, paused=False):
     """One quiet push per dump, when it ends."""
     hm = lambda t: time.strftime("%H:%M", time.localtime(t))
     mins = max(1, round((a["now"] - a["start"]) / 60))
     early = why.startswith(("water not cooling", "no boiler reading", "burner fired"))
     title = ("ecobee dump ended early: %s" % a["name"] if early
              else "ecobee dump: %s, %d min" % (a["name"], mins))
+    if paused:
+        title = "ecobee dump paused until tomorrow: %s" % a["name"]
+        why += ("; the zone didn't open %d times today, so no more tries "
+                "until midnight" % _dump["fails"])
     msg = ("%s-%s: boiler water %s, peak %s, now %s. Ended: %s."
            % (hm(a["start"]), hm(a["now"]), fmt_temp(a.get("b0", a["peak"])),
               fmt_temp(a["peak"]), "?" if boiler is None else fmt_temp(boiler), why))
@@ -2075,7 +2093,7 @@ def heat_dump_step(extra, now=None):
             return
         today = time.strftime("%Y-%m-%d", time.localtime(now))
         if _dump["day"] != today:
-            _dump.update(day=today, count=0)
+            _dump.update(day=today, count=0, fails=0)
         if (boiler < ECOBEE_DUMP_START_C or state in FIRING_STATES
                 or state == ERROR_STATE
                 or now < _dump["cooldown"] or _dump["count"] >= ECOBEE_DUMP_MAX_PER_DAY):
@@ -2098,6 +2116,13 @@ def heat_dump_step(extra, now=None):
         if t["mode"] not in ("heat", "auto", "auxHeatOnly"):
             _dump["cooldown"] = now + 60 * 60
             _dump_log("skip", boiler, t["name"], "thermostat mode is %s" % t["mode"])
+            return
+        if (t.get("actual") is not None and t.get("heat") is not None
+                and t["actual"] >= t["heat"] + DUMP_ROOM_MARGIN_F * 10):
+            _dump["cooldown"] = now + 30 * 60   # ecobee won't call: don't try
+            _dump_log("skip", boiler, t["name"], "room %.1f degF is %.1f above its "
+                      "setpoint %.1f" % (t["actual"] / 10.0, (t["actual"] - t["heat"]) / 10.0,
+                                         t["heat"] / 10.0))
             return
         busy = [x["name"] for x in stats if x["calling"]]
         if busy:                         # a zone is open: the pump is moving the heat
