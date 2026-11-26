@@ -349,7 +349,11 @@ It asks for your ecobee email, password and (if set) the two-step code, and
 writes `pellet_watch_ecobee_token.json`, a sign-in token only; the password is
 not saved. Copy it beside `pellet_watch.py` on the NAS (not into the web
 folder) and delete your local copy. Then set `"ECOBEE_DUMP": true` and
-`"ECOBEE_DUMP_THERMOSTAT"` to the thermostat's name (required). Check with:
+`"ECOBEE_DUMP_THERMOSTATS"` to the thermostats' names in order of preference,
+e.g. `["Main Floor", "Upstairs"]`: each dump goes to the first one that can
+take the heat (heat mode, room not already 1.5 degF above its setpoint, and
+not ignoring holds today). A single `"ECOBEE_DUMP_THERMOSTAT"` name still
+works. Check with:
 
 ```
 python3 pellet_watch.py --ecobee-status     # read-only

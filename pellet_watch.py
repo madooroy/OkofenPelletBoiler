@@ -180,7 +180,9 @@ ERROR_ALERT_MINUTES = 3
 # --serve logger and pellet_watch_ecobee_token.json from tools/ecobee_login.py.
 ECOBEE_DUMP = False
 ECOBEE_DUMP_DRY_RUN = False      # True = only log what it would do
-ECOBEE_DUMP_THERMOSTAT = ""      # thermostat name (required when ECOBEE_DUMP is on)
+ECOBEE_DUMP_THERMOSTAT = ""      # thermostat name, or use the list below
+ECOBEE_DUMP_THERMOSTATS = []     # names in order of preference; the first one
+                                 # that can take the heat gets the dump
 ECOBEE_DUMP_START_C = 82.8       # 181 degF
 ECOBEE_DUMP_STOP_C = 80.0        # 176 degF: the zone keeps running a minute or
                                  # two after release, so stop early enough
@@ -231,7 +233,7 @@ SETTING_TYPES = {
     "SETPOINT_HINT_DAYS": (int, float), "SETPOINT_HINT_MIN": (int, float, type(None)),
     "LOG_SECONDS": int, "LOG_KEEP_MONTHS": int, "DATA_DIR": str,
     "ERROR_ALERT": bool, "ERROR_ALERT_MINUTES": (int, float),
-    "ECOBEE_DUMP": bool, "ECOBEE_DUMP_DRY_RUN": bool, "ECOBEE_DUMP_THERMOSTAT": str,
+    "ECOBEE_DUMP": bool, "ECOBEE_DUMP_DRY_RUN": bool, "ECOBEE_DUMP_THERMOSTAT": str, "ECOBEE_DUMP_THERMOSTATS": list,
     "ECOBEE_DUMP_START_C": (int, float), "ECOBEE_DUMP_STOP_C": (int, float),
     "ECOBEE_DUMP_MINUTES": (int, float), "ECOBEE_DUMP_BUMP_F": (int, float),
     "ECOBEE_DUMP_MAX_PER_DAY": int, "ECOBEE_DUMP_NOTIFY": bool,
@@ -326,8 +328,8 @@ def load_config():
         raise SetupError("ECOBEE_DUMP_STOP_C must be below ECOBEE_DUMP_START_C")
     if g["ECOBEE_DUMP_STOP_C"] < 70:     # stay well above the ~64 degC restart
         raise SetupError("ECOBEE_DUMP_STOP_C must be at least 70 (degC)")
-    if g["ECOBEE_DUMP"] and not g["ECOBEE_DUMP_THERMOSTAT"]:
-        raise SetupError("ECOBEE_DUMP needs ECOBEE_DUMP_THERMOSTAT (the thermostat's "
+    if g["ECOBEE_DUMP"] and not (g["ECOBEE_DUMP_THERMOSTAT"] or g["ECOBEE_DUMP_THERMOSTATS"]):
+        raise SetupError("ECOBEE_DUMP needs ECOBEE_DUMP_THERMOSTATS (the thermostats' "
                          "name; --ecobee-status lists them)")
     if not 0 < g["ECOBEE_DUMP_MINUTES"] <= 30 or not 0 < g["ECOBEE_DUMP_BUMP_F"] <= 5:
         raise SetupError("ECOBEE_DUMP_MINUTES must be 1-30 and ECOBEE_DUMP_BUMP_F 1-5")
@@ -1932,12 +1934,27 @@ def ecobee_thermostats(identifier=None):
     return out
 
 
+def _dump_names():
+    names = [n for n in ECOBEE_DUMP_THERMOSTATS if isinstance(n, str) and n.strip()]
+    return names or ([ECOBEE_DUMP_THERMOSTAT] if ECOBEE_DUMP_THERMOSTAT else [])
+
+
+def _dump_candidates(stats):
+    """The dump thermostats in order of preference."""
+    out = []
+    for name in _dump_names():
+        t = next((x for x in stats if (x["name"] or "").lower() == name.lower()), None)
+        if t is None:
+            raise RuntimeError("no ecobee thermostat named %r (found: %s)" % (
+                name, ", ".join(x["name"] or "?" for x in stats)))
+        out.append(t)
+    if not out:
+        raise RuntimeError("no dump thermostat set (ECOBEE_DUMP_THERMOSTATS)")
+    return out
+
+
 def _dump_target(stats):
-    for t in stats:
-        if (t["name"] or "").lower() == ECOBEE_DUMP_THERMOSTAT.lower():
-            return t
-    raise RuntimeError("no ecobee thermostat named %r (found: %s)" % (
-        ECOBEE_DUMP_THERMOSTAT, ", ".join(t["name"] or "?" for t in stats)))
+    return _dump_candidates(stats)[0]
 
 
 def ecobee_hold(t, minutes, bump_f):
@@ -1998,7 +2015,7 @@ DUMP_FAILS_PER_DAY = 2                 # then stop for the day
 DUMP_ROOM_MARGIN_F = 1.5               # room this far above the setpoint:
                                        # ecobee ignores the hold, so don't try
 _dump = {"active": None, "cooldown": 0, "day": None, "count": 0, "fail_noted": False,
-         "fails": 0,
+         "fails": {}, "tcool": {},
          "last": []}
 FIRING_STATES = (1, 2, 3, 4)             # start, ignition, softstart, powerburn
 DUMP_CHECK_S = 8 * 60                    # by now the water must be cooling
@@ -2023,12 +2040,10 @@ def _end_dump(boiler, why, release=True):
     a, _dump["active"] = _dump["active"], None     # cleared first: never repeats
     _dump["cooldown"] = a["now"] + 10 * 60
     paused = False
-    if why.startswith("water not cooling"):
-        _dump["fails"] += 1
-        _dump["cooldown"] = a["now"] + DUMP_FAIL_BACKOFF_S
-        if _dump["fails"] >= DUMP_FAILS_PER_DAY:
-            _dump["count"] = ECOBEE_DUMP_MAX_PER_DAY      # no more today
-            paused = True
+    if why.startswith("water not cooling"):     # this thermostat ignored the hold
+        n = _dump["fails"][a["name"]] = _dump["fails"].get(a["name"], 0) + 1
+        _dump["tcool"][a["name"]] = a["now"] + DUMP_FAIL_BACKOFF_S
+        paused = n >= DUMP_FAILS_PER_DAY            # no more on it today
     if release and not a.get("dry"):
         try:
             why += "; " + ecobee_release(a["id"], a["heat"], a["end"])
@@ -2050,7 +2065,7 @@ def _notify_dump(a, boiler, why, paused=False):
     if paused:
         title = "ecobee dump paused until tomorrow: %s" % a["name"]
         why += ("; the zone didn't open %d times today, so no more tries "
-                "until midnight" % _dump["fails"])
+                "on it until midnight" % _dump["fails"].get(a["name"], 0))
     msg = ("%s-%s: boiler water %s, peak %s, now %s. Ended: %s."
            % (hm(a["start"]), hm(a["now"]), fmt_temp(a.get("b0", a["peak"])),
               fmt_temp(a["peak"]), "?" if boiler is None else fmt_temp(boiler), why))
@@ -2093,7 +2108,7 @@ def heat_dump_step(extra, now=None):
             return
         today = time.strftime("%Y-%m-%d", time.localtime(now))
         if _dump["day"] != today:
-            _dump.update(day=today, count=0, fails=0)
+            _dump.update(day=today, count=0, fails={}, tcool={})
         if (boiler < ECOBEE_DUMP_START_C or state in FIRING_STATES
                 or state == ERROR_STATE
                 or now < _dump["cooldown"] or _dump["count"] >= ECOBEE_DUMP_MAX_PER_DAY):
@@ -2103,7 +2118,7 @@ def heat_dump_step(extra, now=None):
             return                       # tank) is taking the heat
         try:
             stats = ecobee_thermostats()
-            t = _dump_target(stats)
+            cands = _dump_candidates(stats)
             _dump["fail_noted"] = False
         except Exception as e:
             _dump["cooldown"] = now + 15 * 60
@@ -2113,21 +2128,31 @@ def heat_dump_step(extra, now=None):
                 push("ecobee heat dump: cannot reach the thermostat", str(e),
                      priority="default")
             return
-        if t["mode"] not in ("heat", "auto", "auxHeatOnly"):
-            _dump["cooldown"] = now + 60 * 60
-            _dump_log("skip", boiler, t["name"], "thermostat mode is %s" % t["mode"])
-            return
-        if (t.get("actual") is not None and t.get("heat") is not None
-                and t["actual"] >= t["heat"] + DUMP_ROOM_MARGIN_F * 10):
-            _dump["cooldown"] = now + 30 * 60   # ecobee won't call: don't try
-            _dump_log("skip", boiler, t["name"], "room %.1f degF is %.1f above its "
-                      "setpoint %.1f" % (t["actual"] / 10.0, (t["actual"] - t["heat"]) / 10.0,
-                                         t["heat"] / 10.0))
-            return
         busy = [x["name"] for x in stats if x["calling"]]
         if busy:                         # a zone is open: the pump is moving the heat
             _dump["cooldown"] = now + 5 * 60
-            _dump_log("skip", boiler, t["name"], "already calling: %s" % ", ".join(busy))
+            _dump_log("skip", boiler, "", "already calling: %s" % ", ".join(busy))
+            return
+        t, why_not = None, []
+        for c in cands:                  # first thermostat that can take the heat
+            if c["mode"] not in ("heat", "auto", "auxHeatOnly"):
+                why_not.append("%s: mode %s" % (c["name"], c["mode"]))
+            elif _dump["fails"].get(c["name"], 0) >= DUMP_FAILS_PER_DAY:
+                why_not.append("%s: paused for today" % c["name"])
+            elif now < _dump["tcool"].get(c["name"], 0):
+                why_not.append("%s: zone didn't open last time" % c["name"])
+            elif (c.get("actual") is not None and c.get("heat") is not None
+                  and c["actual"] >= c["heat"] + DUMP_ROOM_MARGIN_F * 10):
+                # ecobee ignores the hold when the room is already this warm
+                why_not.append("%s: room %.1f degF is %.1f above its setpoint %.1f" % (
+                    c["name"], c["actual"] / 10.0, (c["actual"] - c["heat"]) / 10.0,
+                    c["heat"] / 10.0))
+            else:
+                t = c
+                break
+        if t is None:
+            _dump["cooldown"] = now + 15 * 60
+            _dump_log("skip", boiler, "", "; ".join(why_not))
             return
         _dump["count"] += 1
         if ECOBEE_DUMP_DRY_RUN:
@@ -2164,10 +2189,11 @@ def ecobee_status():
                 t["name"], (t["actual"] or 0) / 10.0, (t["heat"] or 0) / 10.0, t["mode"],
                 "calling for heat" if t["calling"] else "idle"))
         print("ecobee sign-in works.")
-        if ECOBEE_DUMP_THERMOSTAT:
-            print("Dump thermostat: %s" % _dump_target(stats)["name"])
+        if _dump_names():
+            print("Dump thermostats, in order: %s"
+                  % ", ".join(t["name"] for t in _dump_candidates(stats)))
         else:
-            print("Set ECOBEE_DUMP_THERMOSTAT to one of the names above.")
+            print("Set ECOBEE_DUMP_THERMOSTATS to names above, in order of preference.")
         return 0
     except Exception as e:
         print("ecobee: %s" % e)
