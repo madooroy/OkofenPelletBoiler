@@ -156,8 +156,16 @@ In **Control Panel → Task Scheduler** create two tasks:
    - Run command: `python3 /volume1/scripts/pellet_watch/pellet_watch.py`
    - Task Settings: tick **Send run details by email** and **only when the script terminates abnormally**. The script exits with an error code only on checks that raise an alert (each heads-up milestone, the order point, the hard stop, then once a day until you restart the count), so DSM emails you then and stays quiet otherwise. The first line of the email says which alert it is. With [script email alerts](#email-alerts-optional) set up, alerts come in the script's own plain email instead and DSM emails only on real problems. (Control Panel → Notification → Email must be set up.)
 2. **Triggered Task → User-defined script**, Event **Boot-up**.
-   - Run command: `python3 /volume1/scripts/pellet_watch/pellet_watch.py --serve`
-   - Select it and click **Run** once to start it now. This powers the "Pellets delivered?" button. The buttons always run the current `pellet_watch.py`, so updating the script doesn't need a restart for them. The minute logger reloads the settings file when it changes. Restart this task after changing `SERVE_PORT`, `HTML_PATH`, `PAGE_URL` or `ALLOWED_HOSTS`, or after updating `pellet_watch.py` if you want the logger and the page server to run the new code.
+   - Run command (the first two lines stop a copy that is already running, so clicking **Run** doubles as a restart; DSM can't stop this kind of task itself):
+
+     ```
+     pkill -f "^[^ ]*python3 [^ ]*pellet_watch[.]py --serve"
+     sleep 2
+     python3 /volume1/scripts/pellet_watch/pellet_watch.py --serve
+     ```
+
+     The `^...python3` anchor matters: without it, `pkill` would also match the task's own shell (whose command line contains the third line) and kill it.
+   - Select it and click **Run** once to start it now. This powers the "Pellets delivered?" button. The buttons always run the current `pellet_watch.py`, so updating the script doesn't need a restart for them. The minute logger reloads the settings file when it changes. Click **Run** again after changing `SERVE_PORT`, `HTML_PATH`, `PAGE_URL` or `ALLOWED_HOSTS`, or after updating `pellet_watch.py`, so the logger and the page server run the new code.
 
 For both tasks, the safest user is a dedicated non-admin DSM account (e.g. `pelletwatch`) with read/write access to `scripts` and `web` only. `root` works but gives the script more access than it needs.
 
