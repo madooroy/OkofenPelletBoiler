@@ -159,12 +159,14 @@ In **Control Panel → Task Scheduler** create two tasks:
    - Run command (the first two lines stop a copy that is already running, so clicking **Run** doubles as a restart; DSM can't stop this kind of task itself):
 
      ```
-     pkill -f "^[^ ]*python3 [^ ]*pellet_watch[.]py --serve"
+     pkill -f "^python3 .*pellet_watch.py --serve"
      sleep 2
-     python3 /volume1/scripts/pellet_watch/pellet_watch.py --serve
+     setsid nohup python3 /volume1/scripts/pellet_watch/pellet_watch.py --serve >/dev/null 2>&1 &
      ```
 
-     The `^...python3` anchor matters: without it, `pkill` would also match the task's own shell (whose command line contains the third line) and kill it.
+     The last line runs the logger in the background, so the task itself finishes at once and the logger keeps running.
+
+     The `^python3` anchor matters: without it, `pkill` would also match the task's own shell (whose command line contains the third line) and kill it.
    - Select it and click **Run** once to start it now. This powers the "Pellets delivered?" button. The buttons always run the current `pellet_watch.py`, so updating the script doesn't need a restart for them. The minute logger reloads the settings file when it changes. Click **Run** again after changing `SERVE_PORT`, `HTML_PATH`, `PAGE_URL` or `ALLOWED_HOSTS`, or after updating `pellet_watch.py`, so the logger and the page server run the new code.
 
 For both tasks, the safest user is a dedicated non-admin DSM account (e.g. `pelletwatch`) with read/write access to `scripts` and `web` only. `root` works but gives the script more access than it needs.
