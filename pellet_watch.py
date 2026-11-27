@@ -187,7 +187,7 @@ ECOBEE_DUMP_START_C = 82.8       # 181 degF
 ECOBEE_DUMP_STOP_C = 80.0        # 176 degF: the zone keeps running a minute or
                                  # two after release, so stop early enough
                                  # that the water doesn't fall to the restart
-ECOBEE_DUMP_MINUTES = 12         # the hold ends itself after this
+ECOBEE_DUMP_MINUTES = 12         # the script releases the hold after this
 ECOBEE_DUMP_BUMP_F = 3
 ECOBEE_DUMP_MAX_PER_DAY = 10
 ECOBEE_DUMP_NOTIFY = True        # a quiet (low-priority) push after each dump
@@ -1957,34 +1957,51 @@ def _dump_target(stats):
     return _dump_candidates(stats)[0]
 
 
+DUMP_HOLD_HOURS = 1   # an "hours" hold, the kind the ecobee app sets: on Nov 27
+                      # the ecobee ignored a fixed-end-time (dateTime) hold in a
+                      # room above its schedule but heated on an app hold. The
+                      # script releases it after minutes; if the script died
+                      # mid-dump, the thermostat would still end it after this.
+
+
 def ecobee_hold(t, minutes, bump_f):
     """Hold t's heat setpoint bump_f above the room (or the setpoint, if
-    higher) for minutes. The thermostat ends the hold itself, so a crash
-    here can't leave it on. Returns (heat, end) to recognise it later."""
+    higher). The caller releases it after minutes; the thermostat ends it
+    after DUMP_HOLD_HOURS regardless. Returns (heat, end) to recognise it
+    later; end is the thermostat-local time the ecobee will end it."""
     if not t.get("time"):
         raise RuntimeError("thermostat gave no local time; not setting a hold")
     base = calendar.timegm(time.strptime(t["time"], "%Y-%m-%d %H:%M:%S"))
     heat = max(int(t["heat"]), int(t.get("actual") or 0)) + int(round(bump_f * 10))
     cool = max(int(t["cool"] or 0), heat + 50)
-    start = time.gmtime(base - 60)
-    end = time.gmtime(base + minutes * 60)
+    end = time.gmtime(base + DUMP_HOLD_HOURS * 3600)
     end_s = (time.strftime("%Y-%m-%d", end), time.strftime("%H:%M:%S", end))
     try:
-        _set_hold(t, heat, cool, start, end_s)
+        _set_hold(t, heat, cool)
     except Exception as e:
         e.hold = (heat, end_s)           # it may have been applied anyway
         raise
     return heat, end_s
 
 
-def _set_hold(t, heat, cool, start, end_s):
+def _set_hold(t, heat, cool):
     ecobee_request(body={
         "selection": {"selectionType": "thermostats", "selectionMatch": t["identifier"]},
         "functions": [{"type": "setHold", "params": {
-            "holdType": "dateTime", "heatHoldTemp": heat, "coolHoldTemp": cool,
-            "startDate": time.strftime("%Y-%m-%d", start),
-            "startTime": time.strftime("%H:%M:%S", start),
-            "endDate": end_s[0], "endTime": end_s[1]}}]})
+            "holdType": "holdHours", "holdHours": DUMP_HOLD_HOURS,
+            "heatHoldTemp": heat, "coolHoldTemp": cool}}]})
+
+
+def _end_near(ev, end_s, slack_s=10 * 60):
+    """The event ends within slack_s of end_s (the ecobee works out an
+    hours hold's end itself, so allow for rounding and clock skew)."""
+    try:
+        a = calendar.timegm(time.strptime("%s %s" % (ev["endDate"], ev["endTime"]),
+                                          "%Y-%m-%d %H:%M:%S"))
+        b = calendar.timegm(time.strptime("%s %s" % tuple(end_s), "%Y-%m-%d %H:%M:%S"))
+    except (KeyError, TypeError, ValueError):
+        return False
+    return abs(a - b) <= slack_s
 
 
 def _our_hold_on_top(t, heat, end_s):
@@ -1992,7 +2009,7 @@ def _our_hold_on_top(t, heat, end_s):
     for ev in t["events"]:
         if ev.get("running"):
             return (ev.get("type") == "hold" and ev.get("heatHoldTemp") == heat
-                    and (ev.get("endDate"), ev.get("endTime")) == tuple(end_s))
+                    and _end_near(ev, end_s))
     return False
 
 
@@ -2048,7 +2065,7 @@ def _end_dump(boiler, why, release=True):
         try:
             why += "; " + ecobee_release(a["id"], a["heat"], a["end"])
         except Exception as e:
-            why += "; release failed: %s (the hold ends itself)" % e
+            why += "; release failed: %s (the ecobee ends the hold within %d h)" % (e, DUMP_HOLD_HOURS)
     _dump_log("end", boiler, a["name"], "%s after %.0f min, peak %s" % (
         why, (a["now"] - a["start"]) / 60, a["peak"]))
     if ECOBEE_DUMP_NOTIFY and not a.get("dry"):
@@ -2172,14 +2189,14 @@ def heat_dump_step(extra, now=None):
                 try:
                     note += "; " + ecobee_release(t["identifier"], *e.hold)
                 except Exception as e2:
-                    note += "; release check failed: %s (the hold ends itself)" % e2
+                    note += "; release check failed: %s (the ecobee ends the hold within %d h)" % (e2, DUMP_HOLD_HOURS)
             _dump_log("error", boiler, t["name"], note)
             return
         _dump["active"] = {"id": t["identifier"], "name": t["name"], "heat": heat,
                            "end": end_s, "start": now, "now": now, "peak": boiler,
                            "b0": boiler, "checked": False}
-        _dump_log("start", boiler, t["name"], "hold %.1f degF until %s (room %.1f, "
-                  "setpoint %.1f)" % (heat / 10.0, end_s[1][:5], (t.get("actual") or 0) / 10.0,
+        _dump_log("start", boiler, t["name"], "hold %.1f degF for up to %d min (room %.1f, "
+                  "setpoint %.1f)" % (heat / 10.0, ECOBEE_DUMP_MINUTES, (t.get("actual") or 0) / 10.0,
                                      (t.get("heat") or 0) / 10.0))
 
 
@@ -2203,8 +2220,9 @@ def ecobee_status():
         return 2
 
 
-def ecobee_dump_test(minutes=3):
-    """--ecobee-dump-test: a real short hold on the dump thermostat."""
+def ecobee_dump_test(minutes=5):
+    """--ecobee-dump-test: a real short hold on the dump thermostat, watched
+    for a few minutes and then released."""
     try:
         t = _dump_target(ecobee_thermostats())
         if t["mode"] not in ("heat", "auto", "auxHeatOnly"):
@@ -2214,8 +2232,26 @@ def ecobee_dump_test(minutes=3):
     except Exception as e:
         print("ecobee: %s" % e)
         return 2
-    print("Hold set on %s: %.1f degF until %s; it ends itself. Its zone should "
-          "start calling within a minute or two." % (t["name"], heat / 10.0, end_s[1][:5]))
+    print("Hold set on %s at %s: %.1f degF (room %.1f, setpoint %.1f). Watching for "
+          "%d min, then releasing it." % (t["name"], time.strftime("%H:%M"), heat / 10.0,
+                                          (t.get("actual") or 0) / 10.0,
+                                          (t.get("heat") or 0) / 10.0, minutes), flush=True)
+    called = None
+    for i in range(minutes * 2):
+        time.sleep(30)
+        try:
+            if ecobee_thermostats(t["identifier"])[0]["calling"]:
+                called = called or time.strftime("%H:%M")
+        except Exception as e:
+            print("ecobee: %s" % e, flush=True)
+    try:
+        note = ecobee_release(t["identifier"], heat, end_s)
+    except Exception as e:
+        note = "release failed: %s (the ecobee ends the hold within %d h)" % (e, DUMP_HOLD_HOURS)
+    print(("The thermostat reported heating from %s." % called) if called else
+          "The thermostat did not report heating (its status can lag a few minutes; "
+          "the ecobee log will confirm).")
+    print("Hold %s." % note)
     return 0
 
 

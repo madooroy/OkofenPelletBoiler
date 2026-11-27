@@ -324,9 +324,11 @@ fan run, and the heat goes into the house. The hold is released when the water
 is down to `ECOBEE_DUMP_STOP_C` (176 degF; the zone keeps running briefly after release), at the time limit, if the burner fires, or if
 the water has not started cooling after 8 minutes (the zone never opened;
 ecobee's reported status lags by minutes, so the water is the better test). The hold is set 3 degF above
-the room temperature (or the setpoint, if higher) so the zone really calls,
-and it has its own end time, so the thermostat goes back to its schedule even
-if the NAS stops. The script only resumes the schedule if its own hold is
+the room temperature (or the setpoint, if higher) so the zone really calls.
+It is a 1-hour "hours" hold, the same kind the ecobee app sets: ecobee ignored
+holds with a fixed end time whenever the room was above its schedule, but heats
+on this kind. The script releases it within `ECOBEE_DUMP_MINUTES`; if the NAS
+stopped mid-dump, the thermostat would still return to its schedule within the hour. The script only resumes the schedule if its own hold is
 still the one in force, so a change someone makes at the thermostat during a
 dump is left alone. After a dump the zone didn't open it waits an hour before using that
 thermostat again; after two such failures that thermostat is paused for the
@@ -352,13 +354,12 @@ folder) and delete your local copy. Then set `"ECOBEE_DUMP": true` and
 e.g. `["Main Floor", "Upstairs"]`: each dump goes to the coolest one relative to
 its setpoint (the list order breaks ties), skipping any not in heat mode or
 ignoring holds today. If even that room is 1.5 degF or more above its
-setpoint the hold is set 5 degF above the room instead of 3 (ecobee ignored
-+3 holds then). A single `"ECOBEE_DUMP_THERMOSTAT"` name still
+setpoint the hold is set 5 degF above the room instead of 3. A single `"ECOBEE_DUMP_THERMOSTAT"` name still
 works. Check with:
 
 ```
 python3 pellet_watch.py --ecobee-status     # read-only
-python3 pellet_watch.py --ecobee-dump-test  # a real 3-minute hold
+python3 pellet_watch.py --ecobee-dump-test  # a real hold, watched 5 min, then released
 ```
 
 After each dump you get a quiet, low-priority push saying how long it ran,
